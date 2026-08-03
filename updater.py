@@ -71,16 +71,29 @@ def download_app_update(download_url, current_executable, expected_sha256=None):
 
     batch_code = (
         "@echo off\n"
-        "timeout /t 2 /nobreak > NUL\n"
+        "setlocal\n"
         f'copy /y "{current_executable}" "{backup_executable}" > NUL\n'
         "if errorlevel 1 exit /b 1\n"
-        f'del /f /q "{current_executable}"\n'
+        "set /a update_wait_count=0\n"
+        ":wait_for_app_exit\n"
+        f'del /f /q "{current_executable}" > NUL 2>&1\n'
+        f'if not exist "{current_executable}" goto install_update\n'
+        "set /a update_wait_count+=1\n"
+        "if %update_wait_count% GEQ 60 goto update_failed\n"
+        "timeout /t 1 /nobreak > NUL\n"
+        "goto wait_for_app_exit\n"
+        ":install_update\n"
         f'move /y "{temp_executable}" "{current_executable}" > NUL\n'
-        f'if not exist "{current_executable}" copy /y "{backup_executable}" "{current_executable}" > NUL\n'
-        f'if exist "{current_executable}" start "" "{current_executable}"\n'
+        f'if not exist "{current_executable}" goto update_failed\n'
         "timeout /t 2 /nobreak > NUL\n"
+        f'start "" "{current_executable}"\n'
+        "timeout /t 3 /nobreak > NUL\n"
         f'del /f /q "{backup_executable}"\n'
         'del /f /q "%~f0"\n'
+        "exit /b 0\n"
+        ":update_failed\n"
+        f'if not exist "{current_executable}" copy /y "{backup_executable}" "{current_executable}" > NUL\n'
+        "exit /b 1\n"
     )
     with open(batch_path, "w", encoding="ascii", newline="\r\n") as handle:
         handle.write(batch_code)
