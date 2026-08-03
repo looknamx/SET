@@ -79,7 +79,7 @@ class BotCoreTests(unittest.TestCase):
         self.assertEqual(manifest["version"], "2.4")
         response.raise_for_status.assert_called_once()
 
-    def test_updater_script_contains_rollback(self):
+    def test_updater_script_waits_for_exit_and_contains_rollback(self):
         with tempfile.TemporaryDirectory() as directory:
             executable = os.path.join(directory, "bot.exe")
             with open(executable, "wb") as handle:
@@ -90,6 +90,9 @@ class BotCoreTests(unittest.TestCase):
                 script = handle.read()
             self.assertIn("update_backup.exe", script)
             self.assertIn("if not exist", script)
+            self.assertIn(":wait_for_app_exit", script)
+            self.assertIn("update_wait_count% GEQ 60", script)
+            self.assertLess(script.index(":wait_for_app_exit"), script.index(":install_update"))
 
 
 if __name__ == "__main__":
