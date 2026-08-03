@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+
+build/
+dist/
+
+.download-*.tmp
+update_temp.exe
+update_backup.exe
+updater.bat
+
+# Per-machine settings
+master.ini
+config_*.ini
+
+# Large runtime assets are better published as release files.
+best.pt
