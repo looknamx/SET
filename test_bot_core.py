@@ -56,6 +56,15 @@ class BotCoreTests(unittest.TestCase):
         self.assertIsNone(bot_utils.parse_device_id("20", 10, 19))
         self.assertEqual(bot_utils.parse_device_id("12", 10, 19), 12)
 
+    def test_mouse_candidates_prefer_physical_devices(self):
+        hwids = {
+            11: "HID\\VID_0B05&PID_1ABE",
+            15: "HID\\VID_1038&PID_182E",
+            16: "LdVMouse",
+        }
+        with mock.patch.object(bot_utils, "_get_mouse_hwid", side_effect=lambda device: hwids.get(device, "")):
+            self.assertEqual(bot_utils._mouse_device_candidates(), [15, 11, 16])
+
     def test_foreground_accepts_same_root_window(self):
         with mock.patch.object(bot_utils.win32gui, "GetForegroundWindow", return_value=20), \
                 mock.patch.object(bot_utils.win32gui, "GetAncestor", side_effect=lambda hwnd, _: 10):

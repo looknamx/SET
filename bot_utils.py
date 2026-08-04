@@ -12,6 +12,36 @@ import win32process
 
 DOWNLOAD_TIMEOUT = (10, 120)
 USER_AGENT = "Mozilla/5.0 Chrome/120.0.0.0"
+VIRTUAL_MOUSE_MARKERS = (
+    "LDVMOUSE",
+    "VIRTUAL",
+    "VMWARE",
+    "VBOX",
+    "RDP_MOU",
+    "VMBUS",
+    "PARALLELS",
+    "QEMU",
+)
+
+
+def _get_mouse_hwid(device_id):
+    try:
+        context = interception.set_devices.__globals__["_g_context"]
+        return context.devices[device_id].get_HWID() or ""
+    except (AttributeError, IndexError, KeyError):
+        return ""
+
+
+def _mouse_device_candidates():
+    physical = []
+    virtual = []
+    for device_id in range(19, 9, -1):
+        hwid = _get_mouse_hwid(device_id)
+        if not hwid:
+            continue
+        destination = virtual if any(marker in hwid.upper() for marker in VIRTUAL_MOUSE_MARKERS) else physical
+        destination.append(device_id)
+    return physical + virtual if physical or virtual else list(range(19, 9, -1))
 
 
 def configure_working_mouse_device(preferred=None):
@@ -20,8 +50,8 @@ def configure_working_mouse_device(preferred=None):
         interception.set_devices(mouse=device_id)
         return device_id, "manual setting"
 
-    # Device 10 is commonly a virtual mouse, so probe physical candidates first.
-    candidates = list(range(11, 20)) + [10]
+    # Composite and virtual devices can move the Windows cursor but be ignored by games.
+    candidates = _mouse_device_candidates()
     original = win32api.GetCursorPos()
     screen_width = max(2, win32api.GetSystemMetrics(0))
     screen_height = max(2, win32api.GetSystemMetrics(1))
@@ -39,7 +69,8 @@ def configure_working_mouse_device(preferred=None):
                 actual = win32api.GetCursorPos()
                 win32api.SetCursorPos(original)
                 if abs(actual[0] - target[0]) <= 2 and abs(actual[1] - target[1]) <= 2:
-                    return device_id, "cursor probe"
+                    hwid = _get_mouse_hwid(device_id).split("\0", 1)[0]
+                    return device_id, f"cursor probe: {hwid or 'unknown device'}"
             except Exception:
                 continue
     finally:
