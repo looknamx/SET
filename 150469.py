@@ -42,7 +42,7 @@ from updater import (
 # =========================================================
 # 🌟 ตั้งค่า Auto-Update 
 # =========================================================
-CURRENT_VERSION = "2.6.1"
+CURRENT_VERSION = "2.6.2"
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/looknamx/SET/main/version.txt"
 GITHUB_MANIFEST_URL = "https://raw.githubusercontent.com/looknamx/SET/main/release_manifest.json"
 GITHUB_DOWNLOAD_URL = "https://github.com/looknamx/SET/releases/latest/download/150469.exe" 
