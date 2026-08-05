@@ -3,6 +3,7 @@ __pycache__/
 
 build/
 dist/
+alerts/
 
 .download-*.tmp
 update_temp.exe

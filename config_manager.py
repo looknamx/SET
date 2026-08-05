@@ -11,6 +11,7 @@ PROFILE_DEFAULTS = {
         "YoloEnabled": "True",
         "BuffEnabled": "True",
         "PotionEnabled": "True",
+        "SkillRotationEnabled": "False",
         "AttackClick": "False",
         "AttackIntervalSec": "0.8",
         "RareItemAction": "Log",
@@ -27,6 +28,25 @@ PROFILE_DEFAULTS = {
         "EnableAutoTpStuck": "False",
         "AutoTpStuckSec": "10.0",
     },
+    "SMART_TARGET": {
+        "Enabled": "True",
+        "BlacklistSec": "15.0",
+        "EdgeMarginPct": "8",
+    },
+    "STUCK_RECOVERY": {
+        "MoveBeforeTeleport": "True",
+        "AttemptsBeforeTeleport": "2",
+        "FailureWindowSec": "30.0",
+        "ProgressDistancePx": "50",
+    },
+    "WATCHDOG": {
+        "Enabled": "True",
+        "WorkerTimeoutSec": "12.0",
+        "GameMissingTimeoutSec": "30.0",
+        "MaxLoopErrors": "5",
+        "DiscordWebhookURL": "",
+        "NotifyCooldownSec": "60.0",
+    },
     "HOTKEYS": {"MasterToggle": "ctrl+f1"},
     "POTIONS": {
         "0": "HP,80,f5,50,True",
@@ -34,6 +54,7 @@ PROFILE_DEFAULTS = {
         "2": "SP,20,f7,50,True",
     },
     "AUTO_BUFF_ITEM": {"esc": "150.0", "u": "150.0", "i": "150.0", "o": "150.0"},
+    "SKILL_ROTATION": {},
 }
 
 MASTER_DEFAULTS = {"GLOBAL": {"UIScale": "1.0", "ActiveProfile": "Profile 1"}}
