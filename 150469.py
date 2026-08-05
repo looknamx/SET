@@ -11,40 +11,55 @@ import configparser
 import threading
 import customtkinter as ctk
 import gc
+import hashlib
+import requests
+from datetime import datetime
 from collections import deque
 from PIL import Image
 from ultralytics import YOLO
 from bot_utils import (
     clamp_float,
     clamp_int,
+    configure_keyboard_device,
     configure_working_mouse_device,
     download_file,
     game_is_active,
     get_safe_window_rect,
     get_window_debug_info,
     get_window_handle,
+    interception_driver_ready,
     parse_bool,
-    parse_device_id,
     safe_click,
     safe_move_to,
     safe_press,
-    select_locked_target,
 )
 from config_manager import load_master, load_profile, save_profile
 from updater import (
     download_app_update,
+    download_validated_model,
     fetch_latest_version,
+    fetch_model_manifest,
     fetch_release_manifest,
     is_newer_version,
     launch_updater,
+)
+from runtime_systems import (
+    PreflightResult,
+    SmartTargetManager,
+    StuckRecoveryManager,
+    evaluate_worker_health,
+    load_with_single_recovery,
+    select_due_skill,
+    select_potion_action,
 )
 
 # =========================================================
 # 🌟 ตั้งค่า Auto-Update 
 # =========================================================
-CURRENT_VERSION = "2.6.2"
+CURRENT_VERSION = "2.7"
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/looknamx/SET/main/version.txt"
 GITHUB_MANIFEST_URL = "https://raw.githubusercontent.com/looknamx/SET/main/release_manifest.json"
+GITHUB_MODEL_MANIFEST_URL = "https://raw.githubusercontent.com/looknamx/SET/main/model_manifest.json"
 GITHUB_DOWNLOAD_URL = "https://github.com/looknamx/SET/releases/latest/download/150469.exe" 
 GITHUB_MODEL_URL = "https://github.com/looknamx/SET/releases/latest/download/best.pt" 
 GITHUB_EXE_SHA256 = ""
@@ -111,10 +126,22 @@ class BotApp(ctk.CTk):
         self.model = None
         self.template_dead = None
         self.potion_widgets = []
+        self.skill_widgets = []
         self.ui_scale = 1.0 
         self.active_profile = "Profile 1"
         self._log_times = {}
         self.release_manifest = {}
+        self.model_manifest = {}
+        self.model_validated = False
+        self.vitals_lock = threading.Lock()
+        self.latest_vitals = {"hp": None, "sp": None, "updated": 0.0}
+        self.combat_active = False
+        self.worker_heartbeats = {}
+        self.worker_errors = {}
+        self.worker_error_times = {}
+        self.run_started_at = 0.0
+        self._watchdog_alert_times = {}
+        self._preflight_running = False
 
         self.load_master_config()
         
@@ -167,6 +194,7 @@ class BotApp(ctk.CTk):
         self.yolo_enabled = parse_bool(config['GENERAL'].get('YoloEnabled'), True)
         self.buff_enabled = parse_bool(config['GENERAL'].get('BuffEnabled'), True)
         self.potion_enabled = parse_bool(config['GENERAL'].get('PotionEnabled'), True)
+        self.skill_rotation_enabled = parse_bool(config['GENERAL'].get('SkillRotationEnabled'), False)
         self.attack_click = parse_bool(config['GENERAL'].get('AttackClick'), False)
         self.attack_interval = clamp_float(config['GENERAL'].get('AttackIntervalSec', '0.8'), 0.8, 0.1, 10.0)
         self.rare_item_action = config['GENERAL'].get('RareItemAction', 'Log').strip().title()
@@ -190,6 +218,22 @@ class BotApp(ctk.CTk):
         
         self.auto_tp_stuck = parse_bool(config['TELEPORT'].get('EnableAutoTpStuck'), False)
         self.auto_tp_stuck_sec = clamp_float(config['TELEPORT'].get('AutoTpStuckSec', '10.0'), 10.0, 1.0, 300.0)
+
+        self.smart_target_enabled = parse_bool(config['SMART_TARGET'].get('Enabled'), True)
+        self.target_blacklist_sec = clamp_float(config['SMART_TARGET'].get('BlacklistSec'), 15.0, 1.0, 300.0)
+        self.target_edge_margin = clamp_float(config['SMART_TARGET'].get('EdgeMarginPct'), 8.0, 0.0, 40.0) / 100.0
+
+        self.stuck_move_enabled = parse_bool(config['STUCK_RECOVERY'].get('MoveBeforeTeleport'), True)
+        self.stuck_attempts_before_tp = clamp_int(config['STUCK_RECOVERY'].get('AttemptsBeforeTeleport'), 2, 1, 10)
+        self.stuck_failure_window = clamp_float(config['STUCK_RECOVERY'].get('FailureWindowSec'), 30.0, 5.0, 600.0)
+        self.target_progress_px = clamp_int(config['STUCK_RECOVERY'].get('ProgressDistancePx'), 50, 10, 500)
+
+        self.watchdog_enabled = parse_bool(config['WATCHDOG'].get('Enabled'), True)
+        self.watchdog_worker_timeout = clamp_float(config['WATCHDOG'].get('WorkerTimeoutSec'), 12.0, 3.0, 120.0)
+        self.watchdog_game_timeout = clamp_float(config['WATCHDOG'].get('GameMissingTimeoutSec'), 30.0, 5.0, 600.0)
+        self.watchdog_max_errors = clamp_int(config['WATCHDOG'].get('MaxLoopErrors'), 5, 1, 100)
+        self.discord_webhook_url = config['WATCHDOG'].get('DiscordWebhookURL', '').strip()
+        self.notify_cooldown = clamp_float(config['WATCHDOG'].get('NotifyCooldownSec'), 60.0, 5.0, 3600.0)
         
         self.buff_settings = {}
         if 'AUTO_BUFF_ITEM' in config:
@@ -209,19 +253,46 @@ class BotApp(ctk.CTk):
                         "en": parts[4].strip().lower() == 'true'
                     })
 
+        self.skills_list = []
+        if 'SKILL_ROTATION' in config:
+            for _, value in config['SKILL_ROTATION'].items():
+                parts = value.split(',')
+                if len(parts) == 5:
+                    self.skills_list.append({
+                        "key": parts[0].strip().lower(),
+                        "cooldown": str(clamp_float(parts[1], 1.0, 0.1, 3600.0)),
+                        "min_sp": str(clamp_int(parts[2], 0, 0, 100)),
+                        "target_only": parts[3].strip().lower() == 'true',
+                        "en": parts[4].strip().lower() == 'true',
+                    })
+
     def check_and_download_model(self):
         model_file = app_path("best.pt")
+        try:
+            manifest = fetch_model_manifest(GITHUB_MODEL_MANIFEST_URL)
+            if is_newer_version(manifest["min_app_version"], CURRENT_VERSION):
+                raise ValueError(
+                    f"model requires app v{manifest['min_app_version']} or newer"
+                )
+            self.model_manifest = manifest
+            print(f">> Latest AI model: {manifest['model_version']}")
+        except Exception as e:
+            print(f">> Model manifest unavailable; using compatibility mode: {e}")
         try:
             self.release_manifest = fetch_release_manifest(GITHUB_MANIFEST_URL)
         except Exception as e:
             print(f">> Release manifest unavailable; using compatibility mode: {e}")
-        if not os.path.exists(model_file):
+        should_download = not os.path.exists(model_file)
+        if getattr(sys, "frozen", False) and not should_download and self._expected_model_hash():
+            should_download = self._model_sha256().lower() != self._expected_model_hash().lower()
+            if should_download:
+                print(">> A newer AI model is available")
+        if should_download:
             self.after(0, lambda: self.lbl_status_main.configure(text="สถานะ: 📥 กำลังโหลดโมเดล AI...", text_color="#FFB000"))
             print(">> 📥 ไม่พบไฟล์โมเดล AI ในเครื่อง กำลังดาวน์โหลดอัตโนมัติ... (อาจใช้เวลา 1-2 นาที ห้ามปิดโปรแกรม)")
             self.update() 
             try:
-                expected_hash = self.release_manifest.get("model_sha256") or GITHUB_MODEL_SHA256 or None
-                download_file(GITHUB_MODEL_URL, model_file, expected_hash)
+                self._download_model("model is missing or outdated")
                 print(">> ✅ ดาวน์โหลดไฟล์ best.pt สำเร็จ!")
                 return True
             except Exception as e:
@@ -230,16 +301,71 @@ class BotApp(ctk.CTk):
                 return False
         return True
 
+    def _expected_model_hash(self):
+        return (
+            self.model_manifest.get("sha256")
+            or self.release_manifest.get("model_sha256")
+            or GITHUB_MODEL_SHA256
+            or None
+        )
+
+    def _model_download_url(self):
+        return self.model_manifest.get("download_url") or GITHUB_MODEL_URL
+
+    def _download_model(self, reason):
+        model_file = app_path("best.pt")
+        self.lbl_status_main.configure(text="Status: downloading AI model...", text_color="#FFB000")
+        print(f">> Downloading AI model: {reason}")
+        actual_hash = download_validated_model(
+            self._model_download_url(),
+            model_file,
+            self._expected_model_hash(),
+            self._validate_model_path,
+        )
+        print(f">> AI model downloaded (SHA256 {actual_hash[:12]}...)")
+        return actual_hash
+
+    def _load_and_validate_model(self):
+        return self._validate_model_path(app_path("best.pt"))
+
+    def _validate_model_path(self, model_path):
+        model = YOLO(model_path)
+        model(np.zeros((160, 160, 3), dtype=np.uint8), verbose=False, conf=0.1)
+        return model
+
+    def load_model_with_recovery(self):
+        if not self.check_and_download_model():
+            return False
+        def recover_model(first_error):
+            print(f">> AI model load/inference failed: {first_error}")
+            self.model = None
+            self.model_validated = False
+            gc.collect()
+            self._download_model("load or inference validation failed")
+
+        try:
+            self.model, recovered = load_with_single_recovery(
+                self._load_and_validate_model, recover_model
+            )
+            self.model_validated = True
+            if recovered:
+                print(">> AI model recovered successfully after downloading a fresh copy")
+            return True
+        except Exception as error:
+            self.model = None
+            self.model_validated = False
+            print(f">> AI model is unavailable after recovery: {error}")
+            return False
+
     def init_bot_systems(self):
         self.lbl_status_main.configure(text="สถานะ: 🟡 กำลังเตรียม AI...", text_color="orange")
         self.update()
-        if not self.check_and_download_model(): return
+        if not self.load_model_with_recovery():
+            self.lbl_status_main.configure(text="Status: AI model unavailable", text_color="red")
+            return
         try:
-            self.model = YOLO(app_path('best.pt'))
-            keyboard_device = parse_device_id(self.keyboard_device, 0, 9)
-            if keyboard_device is not None:
-                interception.set_devices(keyboard=keyboard_device)
-                print(f">> Keyboard device: {keyboard_device} (manual setting)")
+            keyboard_device, keyboard_hwid = configure_keyboard_device(self.keyboard_device)
+            print(f">> Keyboard device: {keyboard_device} ({keyboard_hwid})")
             mouse_device, mouse_hwid = configure_working_mouse_device(self.mouse_device)
             print(f">> Mouse device: {mouse_device} ({mouse_hwid})")
             img = cv2.imread(bundled_path('dead_button.png'), cv2.IMREAD_UNCHANGED)
@@ -263,13 +389,18 @@ class BotApp(ctk.CTk):
     def _process_force_update_ai(self):
         model_file = app_path("best.pt")
         try:
+            manifest = fetch_model_manifest(GITHUB_MODEL_MANIFEST_URL)
+            if is_newer_version(manifest["min_app_version"], CURRENT_VERSION):
+                raise RuntimeError(
+                    f"AI model requires app v{manifest['min_app_version']} or newer"
+                )
+            self.model_manifest = manifest
             if os.path.exists(model_file):
                 self.model = None; gc.collect(); time.sleep(1)
                 print(">> เตรียมแทนที่โมเดลเดิมเมื่อดาวน์โหลดไฟล์ใหม่สำเร็จ")
             self.after(0, lambda: self.lbl_status_main.configure(text="สถานะ: 📥 กำลังโหลดโมเดล AI...", text_color="#FFB000"))
             print(">> 📥 กำลังดาวน์โหลดโมเดล AI ใหม่ล่าสุดจาก GitHub... (ห้ามปิดโปรแกรม)")
-            expected_hash = self.release_manifest.get("model_sha256") or GITHUB_MODEL_SHA256 or None
-            download_file(GITHUB_MODEL_URL, model_file, expected_hash)
+            self._download_model("manual update")
             print(">> ✅ ดาวน์โหลดไฟล์ best.pt ใหม่สำเร็จ!")
             self.after(0, lambda: self.btn_force_ai.configure(text="✅ อัปเดต AI สำเร็จ", fg_color="green"))
             self.after(0, self.reload_ai_model)
@@ -281,7 +412,8 @@ class BotApp(ctk.CTk):
     def reload_ai_model(self):
         self.lbl_status_main.configure(text="สถานะ: 🟡 กำลังเตรียม AI...", text_color="orange")
         try:
-            self.model = YOLO(app_path('best.pt'))
+            self.model = self._load_and_validate_model()
+            self.model_validated = True
             self.lbl_status_main.configure(text="สถานะ: 🟢 พร้อมใช้งาน", text_color="white")
             print(">> ✅ นำ AI ตัวใหม่เข้าสู่ระบบพร้อมใช้งานแล้ว!")
             self.after(3000, lambda: self.btn_force_ai.configure(text="🔄 บังคับอัปเดตโมเดล AI (best.pt)", fg_color="#8B0000", state="normal", hover_color="#6B0000"))
@@ -315,6 +447,7 @@ class BotApp(ctk.CTk):
         self.var_yolo_en.set(self.yolo_enabled)
         self.var_buff_en.set(self.buff_enabled)
         self.var_pot_en.set(self.potion_enabled)
+        self.var_skill_rotation.set(self.skill_rotation_enabled)
         self.var_attack_click.set(self.attack_click)
         self.var_attack_interval.set(str(self.attack_interval))
         self.var_rare_action.set(self.rare_item_action)
@@ -332,12 +465,25 @@ class BotApp(ctk.CTk):
         
         self.var_auto_tp_stuck.set(self.auto_tp_stuck)
         self.var_auto_tp_stuck_sec.set(str(self.auto_tp_stuck_sec))
+        self.var_smart_target.set(self.smart_target_enabled)
+        self.var_target_blacklist.set(str(self.target_blacklist_sec))
+        self.var_target_edge.set(str(int(self.target_edge_margin * 100)))
+        self.var_stuck_move.set(self.stuck_move_enabled)
+        self.var_stuck_attempts.set(str(self.stuck_attempts_before_tp))
+        self.var_stuck_window.set(str(self.stuck_failure_window))
+        self.var_target_progress.set(str(self.target_progress_px))
+        self.var_watchdog.set(self.watchdog_enabled)
+        self.var_watchdog_worker_timeout.set(str(self.watchdog_worker_timeout))
+        self.var_watchdog_game_timeout.set(str(self.watchdog_game_timeout))
+        self.var_watchdog_errors.set(str(self.watchdog_max_errors))
+        self.var_webhook.set(self.discord_webhook_url)
         
         for widget in self.buff_rows_container.winfo_children(): widget.destroy()
         self.buff_ui_rows.clear()
         for key, val in self.buff_settings.items(): self.add_buff_ui_row(key, str(val))
         
         self.render_potions()
+        self.render_skills()
         self.update_hotkey_display()
 
     def set_ui_scale(self, scale_val):
@@ -390,6 +536,16 @@ class BotApp(ctk.CTk):
         self.log_textbox.pack(side="top", padx=20, pady=5)
         self.lbl_hotkeys = ctk.CTkLabel(self.tab_main, text="", font=("Arial", 13), text_color="#888888", justify="left")
         self.lbl_hotkeys.pack(side="top", pady=(10, 10))
+        self.btn_preflight = ctk.CTkButton(
+            self.tab_main,
+            text="ตรวจสอบระบบ",
+            width=160,
+            height=28,
+            fg_color="#2E7D32",
+            hover_color="#256528",
+            command=self.run_preflight_ui,
+        )
+        self.btn_preflight.pack(side="top", pady=(0, 8))
         self.update_hotkey_display() 
         self.btn_update = ctk.CTkButton(self.tab_main, text="🔄 ตรวจสอบเวอร์ชันใหม่", width=160, height=28, fg_color="#3B8ED0", command=self.check_for_updates)
         self.btn_update.pack(side="bottom", pady=(0, 20))
@@ -414,6 +570,19 @@ class BotApp(ctk.CTk):
         
         self.var_auto_tp_stuck = ctk.BooleanVar(value=self.auto_tp_stuck)
         self.var_auto_tp_stuck_sec = ctk.StringVar(value=str(self.auto_tp_stuck_sec))
+        self.var_smart_target = ctk.BooleanVar(value=self.smart_target_enabled)
+        self.var_target_blacklist = ctk.StringVar(value=str(self.target_blacklist_sec))
+        self.var_target_edge = ctk.StringVar(value=str(int(self.target_edge_margin * 100)))
+        self.var_stuck_move = ctk.BooleanVar(value=self.stuck_move_enabled)
+        self.var_stuck_attempts = ctk.StringVar(value=str(self.stuck_attempts_before_tp))
+        self.var_stuck_window = ctk.StringVar(value=str(self.stuck_failure_window))
+        self.var_target_progress = ctk.StringVar(value=str(self.target_progress_px))
+        self.var_watchdog = ctk.BooleanVar(value=self.watchdog_enabled)
+        self.var_watchdog_worker_timeout = ctk.StringVar(value=str(self.watchdog_worker_timeout))
+        self.var_watchdog_game_timeout = ctk.StringVar(value=str(self.watchdog_game_timeout))
+        self.var_watchdog_errors = ctk.StringVar(value=str(self.watchdog_max_errors))
+        self.var_webhook = ctk.StringVar(value=self.discord_webhook_url)
+        self.var_skill_rotation = ctk.BooleanVar(value=self.skill_rotation_enabled)
 
         ctk.CTkLabel(self.scroll_cfg, text="1. ตั้งค่าพื้นฐาน", font=("Arial", 16, "bold")).pack(anchor="w", pady=(10,5))
         self.create_input_row(self.scroll_cfg, "หน้าต่างเกม:", self.var_game_title)
@@ -463,6 +632,28 @@ class BotApp(ctk.CTk):
         self.btn_save.pack(pady=30)
 
         # ==================== TAB 3: ปั้มยา (POTION) ====================
+        ctk.CTkLabel(self.scroll_cfg, text="5. Smart Target", font=("Arial", 16, "bold")).pack(anchor="w", pady=(15, 5))
+        ctk.CTkSwitch(self.scroll_cfg, text="เปิด Smart Target และ blacklist", variable=self.var_smart_target).pack(anchor="w", padx=20, pady=4)
+        self.create_input_row(self.scroll_cfg, "Blacklist (sec):", self.var_target_blacklist)
+        self.create_input_row(self.scroll_cfg, "Edge margin (%):", self.var_target_edge)
+        ctk.CTkSwitch(self.scroll_cfg, text="ขยับหนีก่อน teleport", variable=self.var_stuck_move).pack(anchor="w", padx=20, pady=4)
+        self.create_input_row(self.scroll_cfg, "Failures before TP:", self.var_stuck_attempts)
+        self.create_input_row(self.scroll_cfg, "Failure window (sec):", self.var_stuck_window)
+        self.create_input_row(self.scroll_cfg, "Progress distance:", self.var_target_progress)
+
+        ctk.CTkLabel(self.scroll_cfg, text="6. Watchdog", font=("Arial", 16, "bold")).pack(anchor="w", pady=(15, 5))
+        ctk.CTkSwitch(self.scroll_cfg, text="เปิด Watchdog", variable=self.var_watchdog).pack(anchor="w", padx=20, pady=4)
+        self.create_input_row(self.scroll_cfg, "Worker timeout:", self.var_watchdog_worker_timeout)
+        self.create_input_row(self.scroll_cfg, "Game missing timeout:", self.var_watchdog_game_timeout)
+        self.create_input_row(self.scroll_cfg, "Max loop errors:", self.var_watchdog_errors)
+        self.create_input_row(self.scroll_cfg, "Discord webhook:", self.var_webhook, show_char="*")
+        ctk.CTkButton(
+            self.scroll_cfg,
+            text="บันทึก Smart Target / Watchdog",
+            height=36,
+            command=self.save_config,
+        ).pack(pady=(15, 25))
+
         self.scroll_pot = ctk.CTkScrollableFrame(self.tab_potion, fg_color="transparent")
         self.scroll_pot.pack(fill="both", expand=True)
 
@@ -480,6 +671,27 @@ class BotApp(ctk.CTk):
             fg_color="#4b4b4b",
             hover_color="#3b3b3b",
             command=lambda: self.add_buff_ui_row("", ""),
+        ).pack(pady=(5, 15))
+
+        ctk.CTkFrame(self.scroll_pot, height=1, fg_color="#444444").pack(fill="x", padx=15, pady=(0, 10))
+        ctk.CTkLabel(self.scroll_pot, text="[ SKILL ROTATION ]", text_color="#66B2FF", font=("Arial", 14, "bold")).pack(pady=(10, 5))
+        ctk.CTkSwitch(self.scroll_pot, text="เปิด Skill Rotation", variable=self.var_skill_rotation).pack(anchor="w", padx=15, pady=5)
+        skill_head = ctk.CTkFrame(self.scroll_pot, fg_color="transparent")
+        skill_head.pack(fill="x", padx=2)
+        skill_head.grid_columnconfigure((0, 1, 2, 3, 4, 5), weight=1)
+        for index, text in enumerate(["เปิด", "ปุ่ม", "CD(s)", "SP>=", "มีเป้า", "ลบ"]):
+            ctk.CTkLabel(skill_head, text=text, font=("Arial", 11, "bold")).grid(row=0, column=index)
+        self.skill_container = ctk.CTkFrame(self.scroll_pot, fg_color="transparent", height=1)
+        self.skill_container.pack(fill="x", pady=2)
+        self.render_skills()
+        ctk.CTkButton(
+            self.scroll_pot,
+            text="+ เพิ่มสกิล",
+            width=120,
+            height=28,
+            fg_color="#2b2b2b",
+            hover_color="#444444",
+            command=self.add_new_skill_row,
         ).pack(pady=(5, 15))
 
         ctk.CTkFrame(self.scroll_pot, height=1, fg_color="#444444").pack(fill="x", padx=15, pady=(0, 10))
@@ -506,6 +718,58 @@ class BotApp(ctk.CTk):
         self.lbl_hp_status = ctk.CTkLabel(self.status_bar, text="HP: --%", font=("Arial", 12, "bold"), text_color="#FF6666"); self.lbl_hp_status.pack(side="left", padx=10, pady=2)
         self.lbl_sp_status = ctk.CTkLabel(self.status_bar, text="SP: --%", font=("Arial", 12, "bold"), text_color="#66B2FF"); self.lbl_sp_status.pack(side="left", padx=10, pady=2)
         self.lbl_status_main = ctk.CTkLabel(self.status_bar, text="สถานะ: รอโหลด...", font=("Arial", 12, "bold"), text_color="orange"); self.lbl_status_main.pack(side="right", padx=10, pady=2)
+
+    def render_skills(self):
+        if not hasattr(self, "skill_container"):
+            return
+        for widget in self.skill_container.winfo_children():
+            widget.destroy()
+        self.skill_widgets.clear()
+        for index, skill in enumerate(self.skills_list):
+            self.create_skill_row(index, skill)
+
+    def create_skill_row(self, index, data):
+        row = ctk.CTkFrame(self.skill_container, fg_color="transparent")
+        row.pack(fill="x", pady=2)
+        row.grid_columnconfigure((0, 1, 2, 3, 4, 5), weight=1)
+        enabled = ctk.BooleanVar(value=data["en"])
+        key = ctk.StringVar(value=data["key"])
+        cooldown = ctk.StringVar(value=str(data["cooldown"]))
+        min_sp = ctk.StringVar(value=str(data["min_sp"]))
+        target_only = ctk.BooleanVar(value=data["target_only"])
+        ctk.CTkSwitch(row, text="", variable=enabled, width=30, switch_width=28, switch_height=14).grid(row=0, column=0)
+        ctk.CTkEntry(row, textvariable=key, width=45, justify="center", height=22).grid(row=0, column=1, padx=2)
+        ctk.CTkEntry(row, textvariable=cooldown, width=52, justify="center", height=22).grid(row=0, column=2, padx=2)
+        ctk.CTkEntry(row, textvariable=min_sp, width=45, justify="center", height=22).grid(row=0, column=3, padx=2)
+        ctk.CTkCheckBox(row, text="", variable=target_only, width=24).grid(row=0, column=4)
+        ctk.CTkButton(row, text="X", width=22, height=22, fg_color="#ff4c4c", hover_color="#cc0000", command=lambda idx=index: self.delete_skill_row(idx)).grid(row=0, column=5)
+        self.skill_widgets.append({
+            "en": enabled,
+            "key": key,
+            "cooldown": cooldown,
+            "min_sp": min_sp,
+            "target_only": target_only,
+        })
+
+    def save_skills_to_list(self):
+        self.skills_list = [{
+            "en": widget["en"].get(),
+            "key": widget["key"].get().strip().lower(),
+            "cooldown": widget["cooldown"].get().strip(),
+            "min_sp": widget["min_sp"].get().strip(),
+            "target_only": widget["target_only"].get(),
+        } for widget in self.skill_widgets]
+
+    def add_new_skill_row(self):
+        self.save_skills_to_list()
+        self.skills_list.append({"key": "", "cooldown": "1.0", "min_sp": "10", "target_only": True, "en": True})
+        self.render_skills()
+
+    def delete_skill_row(self, index):
+        self.save_skills_to_list()
+        if 0 <= index < len(self.skills_list):
+            self.skills_list.pop(index)
+        self.render_skills()
 
     def render_potions(self):
         for widget in self.pot_container.winfo_children(): widget.destroy()
@@ -585,6 +849,7 @@ class BotApp(ctk.CTk):
             'YoloEnabled': str(self.var_yolo_en.get()),
             'BuffEnabled': str(self.var_buff_en.get()),
             'PotionEnabled': str(self.var_pot_en.get()),
+            'SkillRotationEnabled': str(self.var_skill_rotation.get()),
             'AttackClick': str(self.var_attack_click.get()),
             'AttackIntervalSec': self.var_attack_interval.get().strip(),
             'RareItemAction': self.var_rare_action.get().strip(),
@@ -603,6 +868,26 @@ class BotApp(ctk.CTk):
             'EnableAutoTpStuck': str(self.var_auto_tp_stuck.get()),
             'AutoTpStuckSec': self.var_auto_tp_stuck_sec.get().strip()
         }
+
+        config['SMART_TARGET'] = {
+            'Enabled': str(self.var_smart_target.get()),
+            'BlacklistSec': self.var_target_blacklist.get().strip(),
+            'EdgeMarginPct': self.var_target_edge.get().strip(),
+        }
+        config['STUCK_RECOVERY'] = {
+            'MoveBeforeTeleport': str(self.var_stuck_move.get()),
+            'AttemptsBeforeTeleport': self.var_stuck_attempts.get().strip(),
+            'FailureWindowSec': self.var_stuck_window.get().strip(),
+            'ProgressDistancePx': self.var_target_progress.get().strip(),
+        }
+        config['WATCHDOG'] = {
+            'Enabled': str(self.var_watchdog.get()),
+            'WorkerTimeoutSec': self.var_watchdog_worker_timeout.get().strip(),
+            'GameMissingTimeoutSec': self.var_watchdog_game_timeout.get().strip(),
+            'MaxLoopErrors': self.var_watchdog_errors.get().strip(),
+            'DiscordWebhookURL': self.var_webhook.get().strip(),
+            'NotifyCooldownSec': str(self.notify_cooldown),
+        }
         
         self.save_potions_to_list(); config.remove_section('POTIONS'); config.add_section('POTIONS')
         for i, p in enumerate(self.potions_list): config['POTIONS'][str(i)] = f"{p['type']},{p['pct']},{p['key']},{p['dly']},{p['en']}"
@@ -611,6 +896,18 @@ class BotApp(ctk.CTk):
         for row in self.buff_ui_rows:
             k, v = row['key_var'].get().strip().lower(), row['val_var'].get().strip()
             if k and v: config['AUTO_BUFF_ITEM'][k] = v
+
+        self.save_skills_to_list()
+        if 'SKILL_ROTATION' in config:
+            config.remove_section('SKILL_ROTATION')
+        config.add_section('SKILL_ROTATION')
+        for index, skill in enumerate(self.skills_list):
+            if not skill['key']:
+                continue
+            config['SKILL_ROTATION'][str(index)] = (
+                f"{skill['key']},{skill['cooldown']},{skill['min_sp']},"
+                f"{skill['target_only']},{skill['en']}"
+            )
             
         save_profile(config, config_file)
         self.update_runtime_vars(); self.update_hotkey_display() 
@@ -642,6 +939,7 @@ class BotApp(ctk.CTk):
         if self.run_event is not None:
             self.run_event.set()
         self.running = False
+        self.combat_active = False
         if update_ui:
             self.lbl_status_main.configure(text="Status: stopped", text_color="#FF5555")
             print(f">> Bot stopped: {reason}")
@@ -650,29 +948,147 @@ class BotApp(ctk.CTk):
         if self.run_event is run_event:
             self.stop_bot(reason)
 
-    def start_bot(self):
-        if not self.model:
+    def _model_sha256(self):
+        digest = hashlib.sha256()
+        with open(app_path("best.pt"), "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def run_preflight(self, require_active=True):
+        results = []
+        required_sections = (
+            "GENERAL",
+            "AI_CONFIDENCE",
+            "TELEPORT",
+            "SMART_TARGET",
+            "STUCK_RECOVERY",
+            "WATCHDOG",
+        )
+        missing_sections = [section for section in required_sections if not config.has_section(section)]
+        results.append(PreflightResult(
+            "Config",
+            not missing_sections,
+            "profile is valid" if not missing_sections else f"missing: {', '.join(missing_sections)}",
+        ))
+
+        driver_ready = interception_driver_ready()
+        results.append(PreflightResult(
+            "Interception driver",
+            driver_ready,
+            "driver context is ready" if driver_ready else "driver is unavailable",
+        ))
+        if driver_ready:
+            try:
+                keyboard_device, keyboard_hwid = configure_keyboard_device(self.keyboard_device)
+                results.append(PreflightResult(
+                    "Keyboard", bool(keyboard_hwid),
+                    f"device {keyboard_device}: {keyboard_hwid or 'HWID unavailable'}",
+                ))
+            except Exception as error:
+                results.append(PreflightResult("Keyboard", False, str(error)))
+            try:
+                mouse_device, mouse_detail = configure_working_mouse_device(self.mouse_device)
+                results.append(PreflightResult("Mouse", True, f"device {mouse_device}: {mouse_detail}"))
+            except Exception as error:
+                results.append(PreflightResult("Mouse", False, str(error)))
+
+        model_file = app_path("best.pt")
+        model_exists = os.path.isfile(model_file) and os.path.getsize(model_file) > 0
+        if not self.model_validated or self.model is None:
+            self.model_validated = self.load_model_with_recovery()
+            model_exists = os.path.isfile(model_file) and os.path.getsize(model_file) > 0
+        results.append(PreflightResult(
+            "AI model file", model_exists, model_file if model_exists else "best.pt is missing",
+        ))
+        results.append(PreflightResult(
+            "AI inference",
+            self.model_validated and self.model is not None,
+            "load and test inference passed" if self.model_validated else "recovery failed",
+        ))
+        expected_hash = self._expected_model_hash()
+        if model_exists and expected_hash:
+            hash_matches = self._model_sha256().lower() == expected_hash.lower()
+            results.append(PreflightResult(
+                "AI model hash", hash_matches,
+                "release model" if hash_matches else "custom model or release hash mismatch",
+                required=False,
+            ))
+
+        window_info = get_window_debug_info(self.game_title)
+        window_found = bool(window_info["game_hwnd"])
+        results.append(PreflightResult(
+            "Game window", window_found,
+            window_info["game_title"] if window_found else f"not found: {self.game_title}",
+        ))
+        rect = self.get_window_rect() if window_found else None
+        results.append(PreflightResult(
+            "Capture area", bool(rect),
+            f"{rect['width']}x{rect['height']}" if rect else "window is too small or unavailable",
+        ))
+        if require_active:
+            results.append(PreflightResult(
+                "Foreground", bool(window_info["active"]),
+                "game is active" if window_info["active"] else f"active window: {window_info['foreground_title']}",
+            ))
+
+        print(">> Preflight check")
+        for result in results:
+            level = "PASS" if result.passed else ("FAIL" if result.required else "WARN")
+            print(f">> [{level}] {result.name}: {result.detail}")
+        return results
+
+    def run_preflight_ui(self):
+        if self._preflight_running or self.running:
             return
-        if not game_is_active(self.game_title):
-            window_info = get_window_debug_info(self.game_title)
-            print(
-                ">> Game window is not active: "
-                f"configured={self.game_title!r}, matched={window_info['game_title']!r}, "
-                f"foreground={window_info['foreground_title']!r}"
+        self._preflight_running = True
+        self.btn_preflight.configure(state="disabled", text="กำลังตรวจสอบ...")
+        try:
+            results = self.run_preflight(require_active=False)
+            passed = all(result.passed for result in results if result.required)
+            self.lbl_status_main.configure(
+                text="Status: system ready" if passed else "Status: preflight failed",
+                text_color="#55FF55" if passed else "#FF5555",
             )
-            self.lbl_status_main.configure(text="Status: open game window first", text_color="orange")
+        finally:
+            self._preflight_running = False
+            self.btn_preflight.configure(state="normal", text="ตรวจสอบระบบ")
+
+    def start_bot(self):
+        preflight = self.run_preflight(require_active=True)
+        if not all(result.passed for result in preflight if result.required):
+            self.lbl_status_main.configure(text="Status: preflight failed", text_color="#FF5555")
             return
         window_info = get_window_debug_info(self.game_title)
         print(f">> Input target: {window_info['game_title']!r} (HWND {window_info['game_hwnd']})")
 
         self.run_event = threading.Event()
         self.running = True
+        self.combat_active = False
+        self.run_started_at = time.monotonic()
+        self.worker_heartbeats = {
+            "bot": self.run_started_at,
+            "potion": self.run_started_at,
+            "skill": self.run_started_at,
+        }
+        self.worker_errors = {"bot": 0, "potion": 0, "skill": 0}
+        self.worker_error_times = {
+            "bot": deque(),
+            "potion": deque(),
+            "skill": deque(),
+            "input": deque(),
+        }
         self.lbl_status_main.configure(text="Status: running", text_color="#55FF55")
         print(">> Bot started")
         self.worker_threads = [
             threading.Thread(target=self.bot_main_loop, args=(self.run_event,), daemon=True),
             threading.Thread(target=self.potion_loop, args=(self.run_event,), daemon=True),
+            threading.Thread(target=self.skill_rotation_loop, args=(self.run_event,), daemon=True),
         ]
+        if self.watchdog_enabled:
+            self.worker_threads.append(
+                threading.Thread(target=self.watchdog_loop, args=(self.run_event,), daemon=True)
+            )
         for worker in self.worker_threads:
             worker.start()
 
@@ -707,6 +1123,7 @@ class BotApp(ctk.CTk):
                 self.log_throttled("inactive_game", ">> Skip key press: game window is not active")
             return success
         except Exception as e:
+            self.record_worker_error("input", e)
             self.log_throttled("key_press_error", f">> Key press error: {e}")
             return False
 
@@ -717,6 +1134,7 @@ class BotApp(ctk.CTk):
                 self.log_throttled("inactive_game", ">> Skip click: game window is not active")
             return success
         except Exception as e:
+            self.record_worker_error("input", e)
             self.log_throttled("mouse_click_error", f">> Mouse click error: {e}")
             return False
 
@@ -725,6 +1143,23 @@ class BotApp(ctk.CTk):
         if now - self._log_times.get(key, 0.0) >= interval:
             self._log_times[key] = now
             print(message)
+
+    def touch_worker(self, name):
+        self.worker_heartbeats[name] = time.monotonic()
+
+    def record_worker_error(self, name, error):
+        now = time.monotonic()
+        self.worker_heartbeats[name] = now
+        error_times = self.worker_error_times.setdefault(name, deque())
+        error_times.append(now)
+        while error_times and now - error_times[0] > 30.0:
+            error_times.popleft()
+        self.worker_errors[name] = len(error_times)
+        self.log_throttled(
+            f"{name}_loop_error",
+            f">> {name} loop error ({self.worker_errors[name]}): {error}",
+            interval=2.0,
+        )
 
     def potion_loop(self, run_event):
         last_tracker = {}; last_ui_hp, last_ui_sp = -1, -1
@@ -735,6 +1170,7 @@ class BotApp(ctk.CTk):
             while not run_event.is_set():
                 try:
                     time.sleep(0.02)
+                    self.touch_worker("potion")
                     if not game_is_active(self.game_title):
                         time.sleep(0.2)
                         continue
@@ -763,24 +1199,161 @@ class BotApp(ctk.CTk):
                     pct_sp = int(np.median(sp_samples)) if sp_samples else raw_sp
                     if pct_hp != last_ui_hp: self.after(0, lambda v=pct_hp: self.lbl_hp_status.configure(text=f"HP: {v}%")); last_ui_hp = pct_hp
                     if pct_sp != last_ui_sp: self.after(0, lambda v=pct_sp: self.lbl_sp_status.configure(text=f"SP: {v}%")); last_ui_sp = pct_sp
+                    with self.vitals_lock:
+                        self.latest_vitals = {"hp": pct_hp, "sp": pct_sp, "updated": time.monotonic()}
                     
                     if not self.potion_enabled: continue
-                    
-                    t = time.time()
-                    for idx, pot in enumerate(list(self.potions_list)):
-                        if not pot["en"]: continue
-                        target_pct, key, dly, pot_type = int(pot["pct"]), pot["key"], int(pot["dly"])/1000.0, pot["type"]
-                        tk = f"p_{idx}_{key}"
-                        is_low = ((pot_type == "HP" and 2 <= pct_hp < target_pct) or
-                                  (pot_type == "SP" and 2 <= pct_sp < target_pct))
-                        low_counts[tk] = low_counts.get(tk, 0) + 1 if is_low else 0
-                        if low_counts[tk] >= 2 and t - last_tracker.get(tk, 0) >= dly:
-                            if self.human_press(key):
-                                last_tracker[tk] = time.time()
-                                low_counts[tk] = 0
+
+                    action = select_potion_action(
+                        list(self.potions_list), pct_hp, pct_sp, last_tracker, time.monotonic()
+                    )
+                    if action:
+                        _, potion, tracker_key = action
+                        low_counts[tracker_key] = low_counts.get(tracker_key, 0) + 1
+                        if low_counts[tracker_key] >= 2 and self.human_press(potion["key"]):
+                            last_tracker[tracker_key] = time.monotonic()
+                            low_counts[tracker_key] = 0
                 except Exception as e:
-                    print(f">> Potion loop error: {e}")
+                    self.record_worker_error("potion", e)
                     time.sleep(0.2)
+
+    def skill_rotation_loop(self, run_event):
+        last_cast = {}
+        last_global_cast = 0.0
+        while not run_event.is_set():
+            try:
+                time.sleep(0.05)
+                self.touch_worker("skill")
+                if not self.skill_rotation_enabled or not game_is_active(self.game_title):
+                    continue
+                with self.vitals_lock:
+                    sp_percent = self.latest_vitals["sp"]
+                now = time.monotonic()
+                if now - last_global_cast < 0.15:
+                    continue
+                action = select_due_skill(
+                    list(self.skills_list), sp_percent, self.combat_active, last_cast, now
+                )
+                if not action:
+                    continue
+                _, skill, tracker_key = action
+                if self.human_press(skill["key"]):
+                    last_cast[tracker_key] = time.monotonic()
+                    last_global_cast = last_cast[tracker_key]
+                    print(f">> Skill rotation: [{skill['key'].upper()}]")
+            except Exception as error:
+                self.record_worker_error("skill", error)
+                time.sleep(0.2)
+
+    def capture_alert_screenshot(self):
+        try:
+            monitor = self.get_window_rect()
+            if not monitor:
+                return None
+            alert_dir = app_path("alerts")
+            os.makedirs(alert_dir, exist_ok=True)
+            filename = datetime.now().strftime("alert-%Y%m%d-%H%M%S.png")
+            path = os.path.join(alert_dir, filename)
+            with mss.mss() as sct:
+                image = cv2.cvtColor(np.array(sct.grab(monitor)), cv2.COLOR_BGRA2BGR)
+            return path if cv2.imwrite(path, image) else None
+        except Exception as error:
+            self.log_throttled("alert_screenshot", f">> Alert screenshot failed: {error}")
+            return None
+
+    def send_notification(self, message, with_screenshot=True):
+        now = time.monotonic()
+        notification_key = message.split(":", 1)[0]
+        if now - self._watchdog_alert_times.get(notification_key, 0.0) < self.notify_cooldown:
+            return None
+        self._watchdog_alert_times[notification_key] = now
+        screenshot = self.capture_alert_screenshot() if with_screenshot else None
+        print(f">> ALERT: {message}")
+        if not self.discord_webhook_url:
+            return screenshot
+        try:
+            content = f"AI looknam Promax v{CURRENT_VERSION}: {message}"
+            if screenshot:
+                with open(screenshot, "rb") as image_file:
+                    response = requests.post(
+                        self.discord_webhook_url,
+                        data={"content": content},
+                        files={"file": (os.path.basename(screenshot), image_file, "image/png")},
+                        timeout=10,
+                    )
+            else:
+                response = requests.post(
+                    self.discord_webhook_url, json={"content": content}, timeout=10
+                )
+            response.raise_for_status()
+            print(">> Discord notification sent")
+        except Exception as error:
+            self.log_throttled("webhook_error", f">> Discord notification failed: {error}")
+        return screenshot
+
+    def watchdog_alert(self, run_event, reason):
+        screenshot = self.send_notification(f"Watchdog: {reason}")
+        if screenshot:
+            print(f">> Watchdog screenshot: {screenshot}")
+        run_event.set()
+        self.after(0, self.stop_run_if_current, run_event, f"watchdog: {reason}")
+
+    def watchdog_loop(self, run_event):
+        game_missing_since = None
+        invalid_vitals_since = None
+        while not run_event.wait(1.0):
+            try:
+                now = time.monotonic()
+                for worker_name, error_times in list(self.worker_error_times.items()):
+                    while error_times and now - error_times[0] > 30.0:
+                        error_times.popleft()
+                    self.worker_errors[worker_name] = len(error_times)
+                health_error = evaluate_worker_health(
+                    now,
+                    {
+                        worker_name: self.worker_heartbeats.get(worker_name, self.run_started_at)
+                        for worker_name in ("bot", "potion", "skill")
+                    },
+                    self.worker_errors,
+                    self.watchdog_worker_timeout,
+                    self.watchdog_max_errors,
+                )
+                if health_error:
+                    self.watchdog_alert(run_event, health_error)
+                    return
+
+                if not get_window_handle(self.game_title):
+                    game_missing_since = game_missing_since or now
+                    if now - game_missing_since >= self.watchdog_game_timeout:
+                        self.watchdog_alert(run_event, "game window disappeared")
+                        return
+                else:
+                    game_missing_since = None
+
+                if self.model is None or not self.model_validated:
+                    self.watchdog_alert(run_event, "AI model is unavailable")
+                    return
+
+                if self.potion_enabled and game_is_active(self.game_title):
+                    with self.vitals_lock:
+                        vitals_updated = self.latest_vitals["updated"]
+                        hp_percent = self.latest_vitals["hp"]
+                        sp_percent = self.latest_vitals["sp"]
+                    vitals_reference = vitals_updated or self.run_started_at
+                    if now - vitals_reference > self.watchdog_worker_timeout * 2:
+                        self.watchdog_alert(run_event, "HP/SP reading is stale")
+                        return
+                    if hp_percent in (None, 0) and sp_percent in (None, 0):
+                        invalid_vitals_since = invalid_vitals_since or now
+                        if now - invalid_vitals_since > self.watchdog_worker_timeout * 2:
+                            self.watchdog_alert(run_event, "HP/SP bars cannot be read")
+                            return
+                    else:
+                        invalid_vitals_since = None
+                else:
+                    invalid_vitals_since = None
+            except Exception as error:
+                self.record_worker_error("watchdog", error)
 
     def get_window_rect(self):
         return get_safe_window_rect(self.game_title, self.offset_px)
@@ -794,18 +1367,28 @@ class BotApp(ctk.CTk):
 
     def bot_main_loop(self, run_event):
         now = time.monotonic()
+        target_manager = SmartTargetManager(
+            blacklist_seconds=self.target_blacklist_sec if self.smart_target_enabled else 1.0,
+            edge_margin_ratio=self.target_edge_margin if self.smart_target_enabled else 0.0,
+        )
+        stuck_manager = StuckRecoveryManager(
+            attempts_before_teleport=self.stuck_attempts_before_tp,
+            failure_window_seconds=self.stuck_failure_window,
+        )
         last_buff_cast = {}
         last_death_check = last_move_log = last_rare_alert = last_preview = 0.0
         last_tp_check = target_started = last_attack = now
-        locked_target = None
+        target_progress_anchor = None
         death_hits = 0
         target_hits = 0
         rare_hits = 0
         pause_started = None
+        recovery_grace_until = 0.0
 
         with mss.mss() as sct:
             while not run_event.is_set():
                 try:
+                    self.touch_worker("bot")
                     if not game_is_active(self.game_title):
                         if pause_started is None:
                             pause_started = time.monotonic()
@@ -854,6 +1437,11 @@ class BotApp(ctk.CTk):
                         last_death_check = current_time
                         if death_hits >= 2:
                             print(">> Character death confirmed")
+                            threading.Thread(
+                                target=self.send_notification,
+                                args=("Character death confirmed",),
+                                daemon=True,
+                            ).start()
                             death_hits = 0
                             if self.stop_on_death:
                                 run_event.set()
@@ -888,6 +1476,11 @@ class BotApp(ctk.CTk):
                     if rare_detected and rare_hits >= 2 and current_time - last_rare_alert >= 15.0:
                         _, _, confidence = rare_detected
                         print(f">> Rare item detected ({confidence * 100:.1f}%)")
+                        threading.Thread(
+                            target=self.send_notification,
+                            args=(f"Rare item detected ({confidence * 100:.1f}%)",),
+                            daemon=True,
+                        ).start()
                         last_rare_alert = current_time
                         if self.rare_item_action == "Stop":
                             run_event.set()
@@ -898,38 +1491,68 @@ class BotApp(ctk.CTk):
 
                     target = None
                     if monsters:
-                        target, is_new_target = select_locked_target(
-                            monsters,
-                            locked_target,
-                            (center_x, center_y),
-                            monitor["width"],
+                        decision = target_manager.select(
+                            monsters, (center_x, center_y), monitor["width"], monitor["height"], current_time
                         )
-                        if is_new_target:
+                        target = decision.target
+                        if target is not None and decision.is_new:
                             target_started = current_time
                             target_hits = 1
-                        else:
+                            target_progress_anchor = (target[0], target[1])
+                        elif target is not None:
                             target_hits += 1
-                        locked_target = (target[0], target[1])
-                        last_tp_check = current_time
+                            if target_progress_anchor is None:
+                                target_progress_anchor = (target[0], target[1])
+                            progress_sq = (target[0] - target_progress_anchor[0]) ** 2 + (
+                                target[1] - target_progress_anchor[1]
+                            ) ** 2
+                            if progress_sq >= self.target_progress_px ** 2:
+                                target_started = current_time
+                                target_progress_anchor = (target[0], target[1])
+                        if target is not None:
+                            last_tp_check = current_time
+                        else:
+                            target_hits = 0
+                            target_started = current_time
+                            target_progress_anchor = None
                     else:
-                        locked_target = None
+                        target_manager.clear_lock()
                         target_hits = 0
                         target_started = current_time
+                        target_progress_anchor = None
+
+                    self.combat_active = target is not None
 
                     if target is not None:
                         if target_hits < 2:
                             continue
                         target_x, target_y, _ = target
                         if self.auto_tp_stuck and current_time - target_started >= self.auto_tp_stuck_sec:
-                            print(f">> Target timeout after {self.auto_tp_stuck_sec:.1f}s; teleporting")
-                            safe_move_to(self.game_title, center_x, center_y)
-                            time.sleep(0.1)
-                            if self.human_press(self.teleport_key):
-                                if self.teleport_mode == "Skill":
-                                    time.sleep(0.2)
-                                    self.human_press("enter")
-                                last_tp_check = target_started = time.monotonic()
-                                locked_target = None
+                            target_manager.mark_failed(target, current_time)
+                            recovery = stuck_manager.register_failure(
+                                target, (center_x, center_y), monitor, current_time
+                            )
+                            print(
+                                f">> Target timeout; blacklisted for {self.target_blacklist_sec:.0f}s "
+                                f"(recovery {recovery.recent_failures}/{self.stuck_attempts_before_tp})"
+                            )
+                            if recovery.action == "reposition" and self.stuck_move_enabled and recovery.escape_point:
+                                if self.human_click(*recovery.escape_point):
+                                    print(f">> Stuck recovery: reposition to {recovery.escape_point}")
+                                    time.sleep(0.5)
+                                    recovery_grace_until = current_time + max(2.0, self.teleport_wait)
+                            elif recovery.action == "teleport" and self.auto_tp_stuck:
+                                safe_move_to(self.game_title, center_x, center_y)
+                                time.sleep(0.1)
+                                if self.human_press(self.teleport_key):
+                                    if self.teleport_mode == "Skill":
+                                        time.sleep(0.2)
+                                        self.human_press("enter")
+                                    print(">> Stuck recovery: teleport")
+                            last_tp_check = target_started = time.monotonic()
+                            target_hits = 0
+                            target_progress_anchor = None
+                            self.combat_active = False
                             continue
 
                         if current_time - last_move_log >= 1.5:
@@ -942,7 +1565,11 @@ class BotApp(ctk.CTk):
                         time.sleep(0.05)
                     else:
                         safe_move_to(self.game_title, center_x, center_y)
-                        if self.enable_teleport and current_time - last_tp_check >= self.teleport_wait:
+                        if (
+                            self.enable_teleport
+                            and current_time >= recovery_grace_until
+                            and current_time - last_tp_check >= self.teleport_wait
+                        ):
                             print(f">> No monster for {self.teleport_wait:.1f}s; teleporting")
                             if self.human_press(self.teleport_key):
                                 if self.teleport_mode == "Skill":
@@ -951,7 +1578,7 @@ class BotApp(ctk.CTk):
                                 last_tp_check = target_started = time.monotonic()
                                 time.sleep(0.2)
                 except Exception as e:
-                    self.log_throttled("bot_loop_error", f">> Bot loop error: {e}", interval=2.0)
+                    self.record_worker_error("bot", e)
                     time.sleep(0.5)
 
 if __name__ == "__main__":

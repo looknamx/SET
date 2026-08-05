@@ -1,6 +1,7 @@
 import os
 import subprocess
 import json
+import tempfile
 
 import requests
 
@@ -31,6 +32,27 @@ def fetch_release_manifest(manifest_url):
     }
 
 
+def fetch_model_manifest(manifest_url):
+    response = requests.get(manifest_url, timeout=VERSION_TIMEOUT)
+    response.raise_for_status()
+    manifest = response.json()
+    model_version = str(manifest.get("model_version", "")).strip()
+    download_url = str(manifest.get("download_url", "")).strip()
+    min_app_version = str(manifest.get("min_app_version", "")).strip()
+    if not model_version:
+        raise ValueError("Model manifest does not contain model_version")
+    if not download_url.startswith("https://"):
+        raise ValueError("Model manifest download_url must use HTTPS")
+    if not min_app_version:
+        raise ValueError("Model manifest does not contain min_app_version")
+    return {
+        "model_version": model_version,
+        "download_url": download_url,
+        "sha256": _validate_sha256(manifest.get("sha256", ""), "sha256"),
+        "min_app_version": min_app_version,
+    }
+
+
 def parse_version(version):
     clean = "".join(char for char in str(version) if char.isdigit() or char == ".")
     return tuple(int(part) for part in clean.split(".") if part.isdigit())
@@ -54,6 +76,25 @@ def fetch_latest_version(version_url):
     if not version:
         raise ValueError("The version endpoint returned an empty response")
     return version
+
+
+def download_validated_model(download_url, destination, expected_sha256, validator):
+    destination = os.path.abspath(destination)
+    destination_dir = os.path.dirname(destination)
+    os.makedirs(destination_dir, exist_ok=True)
+    descriptor, candidate = tempfile.mkstemp(
+        prefix=".model-candidate-", suffix=".pt", dir=destination_dir
+    )
+    os.close(descriptor)
+    os.remove(candidate)
+    try:
+        actual_sha256 = download_file(download_url, candidate, expected_sha256)
+        validator(candidate)
+        os.replace(candidate, destination)
+        return actual_sha256
+    finally:
+        if os.path.exists(candidate):
+            os.remove(candidate)
 
 
 def download_app_update(download_url, current_executable, expected_sha256=None):

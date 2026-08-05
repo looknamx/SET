@@ -7,7 +7,21 @@ from unittest import mock
 
 import bot_utils
 from config_manager import load_profile
-from updater import download_app_update, fetch_release_manifest, is_newer_version
+from runtime_systems import (
+    SmartTargetManager,
+    StuckRecoveryManager,
+    evaluate_worker_health,
+    load_with_single_recovery,
+    select_due_skill,
+    select_potion_action,
+)
+from updater import (
+    download_app_update,
+    download_validated_model,
+    fetch_model_manifest,
+    fetch_release_manifest,
+    is_newer_version,
+)
 
 
 class BotCoreTests(unittest.TestCase):
@@ -25,6 +39,10 @@ class BotCoreTests(unittest.TestCase):
             self.assertEqual(profile["GENERAL"]["GameWindowTitle"], "TestRO")
             self.assertTrue(profile.has_section("TELEPORT"))
             self.assertTrue(profile.has_option("GENERAL", "AttackClick"))
+            self.assertTrue(profile.has_section("SMART_TARGET"))
+            self.assertTrue(profile.has_section("STUCK_RECOVERY"))
+            self.assertTrue(profile.has_section("WATCHDOG"))
+            self.assertTrue(profile.has_section("SKILL_ROTATION"))
 
     def test_profile_backs_up_invalid_file(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -49,6 +67,79 @@ class BotCoreTests(unittest.TestCase):
         target, is_new = bot_utils.select_locked_target(monsters, (100, 100), (500, 500), 800)
         self.assertEqual(target, monsters[0])
         self.assertFalse(is_new)
+
+    def test_smart_target_avoids_edges_and_blacklisted_targets(self):
+        manager = SmartTargetManager(blacklist_seconds=10)
+        monsters = [(10, 10, 0.99), (500, 500, 0.75)]
+        decision = manager.select(monsters, (500, 500), 1000, 1000, now=1)
+        self.assertEqual(decision.target, monsters[1])
+        manager.mark_failed(monsters[1], now=2)
+        decision = manager.select(monsters, (500, 500), 1000, 1000, now=3)
+        self.assertEqual(decision.target, monsters[0])
+
+    def test_smart_target_blacklist_expires(self):
+        manager = SmartTargetManager(blacklist_seconds=5)
+        target = (500, 500, 0.9)
+        manager.mark_failed(target, now=1)
+        self.assertIsNone(manager.select([target], (500, 500), 1000, 800, now=2).target)
+        self.assertEqual(manager.select([target], (500, 500), 1000, 800, now=7).target, target)
+
+    def test_stuck_recovery_repositions_before_teleport(self):
+        manager = StuckRecoveryManager(attempts_before_teleport=2)
+        monitor = {"left": 0, "top": 0, "width": 1000, "height": 800}
+        first = manager.register_failure((700, 400, 0.9), (500, 400), monitor, now=1)
+        second = manager.register_failure((700, 400, 0.9), (500, 400), monitor, now=2)
+        self.assertEqual(first.action, "reposition")
+        self.assertLess(first.escape_point[0], 500)
+        self.assertEqual(second.action, "teleport")
+
+    def test_potion_priority_uses_emergency_hp_item_only(self):
+        potions = [
+            {"type": "HP", "pct": "80", "key": "f5", "dly": "50", "en": True},
+            {"type": "HP", "pct": "20", "key": "f6", "dly": "50", "en": True},
+            {"type": "SP", "pct": "30", "key": "f7", "dly": "50", "en": True},
+        ]
+        action = select_potion_action(potions, 10, 10, {}, now=5)
+        self.assertEqual(action[1]["key"], "f6")
+
+    def test_potion_action_respects_per_item_delay(self):
+        potions = [{"type": "HP", "pct": "80", "key": "f5", "dly": "1000", "en": True}]
+        self.assertIsNone(select_potion_action(potions, 50, 100, {"p_0_f5": 5}, now=5.5))
+        self.assertIsNotNone(select_potion_action(potions, 50, 100, {"p_0_f5": 5}, now=6.1))
+
+    def test_skill_rotation_respects_combat_and_sp(self):
+        skills = [
+            {"key": "f1", "cooldown": 2, "min_sp": 50, "target_only": True, "en": True},
+            {"key": "f2", "cooldown": 1, "min_sp": 10, "target_only": False, "en": True},
+        ]
+        self.assertEqual(select_due_skill(skills, 20, False, {}, now=5)[1]["key"], "f2")
+
+    def test_skill_rotation_respects_cooldown(self):
+        skills = [{"key": "f1", "cooldown": 5, "min_sp": 0, "target_only": False, "en": True}]
+        self.assertIsNone(select_due_skill(skills, 100, True, {"s_0_f1": 5}, now=9))
+        self.assertIsNotNone(select_due_skill(skills, 100, True, {"s_0_f1": 5}, now=10))
+
+    def test_model_loader_recovers_once_then_retries(self):
+        calls = []
+
+        def loader():
+            calls.append("load")
+            if calls.count("load") == 1:
+                raise RuntimeError("corrupt model")
+            return "model"
+
+        model, recovered = load_with_single_recovery(
+            loader, lambda error: calls.append(f"recover:{error}")
+        )
+        self.assertEqual(model, "model")
+        self.assertTrue(recovered)
+        self.assertEqual(calls, ["load", "recover:corrupt model", "load"])
+
+    def test_watchdog_detects_stale_worker_and_error_burst(self):
+        reason = evaluate_worker_health(20, {"bot": 1, "potion": 19}, {}, 10, 5)
+        self.assertIn("bot worker", reason)
+        reason = evaluate_worker_health(20, {"bot": 19}, {"input": 5}, 10, 5)
+        self.assertIn("input reached 5 errors", reason)
 
     def test_device_id_parser(self):
         self.assertIsNone(bot_utils.parse_device_id("Auto", 10, 19))
@@ -87,6 +178,41 @@ class BotCoreTests(unittest.TestCase):
             manifest = fetch_release_manifest("https://example.test/manifest.json")
         self.assertEqual(manifest["version"], "2.4")
         response.raise_for_status.assert_called_once()
+
+    def test_model_manifest_validation(self):
+        response = mock.Mock()
+        response.json.return_value = {
+            "model_version": "2026.08.05.1",
+            "download_url": "https://example.test/best.pt",
+            "sha256": "c" * 64,
+            "min_app_version": "2.6.2",
+        }
+        with mock.patch("updater.requests.get", return_value=response):
+            manifest = fetch_model_manifest("https://example.test/model.json")
+        self.assertEqual(manifest["model_version"], "2026.08.05.1")
+        self.assertEqual(manifest["sha256"], "c" * 64)
+
+    def test_validated_model_keeps_old_file_when_validation_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = os.path.join(directory, "best.pt")
+            with open(destination, "wb") as handle:
+                handle.write(b"old model")
+
+            def fake_download(_url, candidate, _expected):
+                with open(candidate, "wb") as handle:
+                    handle.write(b"bad model")
+                return "d" * 64
+
+            with mock.patch("updater.download_file", side_effect=fake_download):
+                with self.assertRaisesRegex(RuntimeError, "invalid model"):
+                    download_validated_model(
+                        "https://example.test/best.pt",
+                        destination,
+                        "d" * 64,
+                        lambda _path: (_ for _ in ()).throw(RuntimeError("invalid model")),
+                    )
+            with open(destination, "rb") as handle:
+                self.assertEqual(handle.read(), b"old model")
 
     def test_updater_script_waits_for_exit_and_contains_rollback(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -32,6 +32,41 @@ def _get_mouse_hwid(device_id):
         return ""
 
 
+def get_input_device_hwid(device_id):
+    try:
+        context = interception.set_devices.__globals__["_g_context"]
+        return (context.devices[device_id].get_HWID() or "").split("\0", 1)[0]
+    except (AttributeError, IndexError, KeyError):
+        return ""
+
+
+def interception_driver_ready():
+    try:
+        context = interception.set_devices.__globals__["_g_context"]
+        return bool(context.valid)
+    except (AttributeError, KeyError):
+        return False
+
+
+def configure_keyboard_device(preferred=None):
+    device_id = parse_device_id(preferred, 0, 9)
+    if device_id is not None:
+        interception.set_devices(keyboard=device_id)
+        return device_id, get_input_device_hwid(device_id) or "manual setting"
+
+    current = interception.get_keyboard()
+    if get_input_device_hwid(current):
+        interception.set_devices(keyboard=current)
+        return current, get_input_device_hwid(current)
+
+    for candidate in range(10):
+        hwid = get_input_device_hwid(candidate)
+        if hwid:
+            interception.set_devices(keyboard=candidate)
+            return candidate, hwid
+    raise RuntimeError("No Interception keyboard device was found")
+
+
 def _mouse_device_candidates():
     physical = []
     virtual = []
@@ -187,11 +222,20 @@ def is_foreground_window(hwnd):
 def get_window_debug_info(title):
     game_hwnd = get_window_handle(title)
     foreground = win32gui.GetForegroundWindow()
+    try:
+        game_title = win32gui.GetWindowText(game_hwnd) if game_hwnd else ""
+    except Exception:
+        game_hwnd = 0
+        game_title = ""
+    try:
+        foreground_title = win32gui.GetWindowText(foreground) if foreground else ""
+    except Exception:
+        foreground_title = ""
     return {
         "game_hwnd": game_hwnd,
-        "game_title": win32gui.GetWindowText(game_hwnd) if game_hwnd else "",
+        "game_title": game_title,
         "foreground_hwnd": foreground,
-        "foreground_title": win32gui.GetWindowText(foreground) if foreground else "",
+        "foreground_title": foreground_title,
         "active": is_foreground_window(game_hwnd),
     }
 
@@ -200,7 +244,10 @@ def get_safe_window_rect(title, offset_px):
     hwnd = get_window_handle(title)
     if not hwnd:
         return None
-    left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+    try:
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+    except Exception:
+        return None
     width = (right - left) - (offset_px * 2)
     height = (bottom - top) - (offset_px * 2)
     if width <= 0 or height <= 0:
