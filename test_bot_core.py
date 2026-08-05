@@ -21,6 +21,7 @@ from updater import (
     fetch_model_manifest,
     fetch_release_manifest,
     is_newer_version,
+    launch_updater,
 )
 
 
@@ -227,7 +228,20 @@ class BotCoreTests(unittest.TestCase):
             self.assertIn("if not exist", script)
             self.assertIn(":wait_for_app_exit", script)
             self.assertIn("update_wait_count% GEQ 60", script)
+            self.assertIn("PYINSTALLER_RESET_ENVIRONMENT=1", script)
             self.assertLess(script.index(":wait_for_app_exit"), script.index(":install_update"))
+
+    def test_updater_launch_resets_pyinstaller_environment(self):
+        with mock.patch.dict(
+            os.environ,
+            {"_PYI_APPLICATION_HOME_DIR": "stale", "NORMAL_VALUE": "kept"},
+            clear=True,
+        ), mock.patch("updater.subprocess.Popen") as popen:
+            launch_updater(os.path.join("C:\\", "bot", "updater.bat"))
+        environment = popen.call_args.kwargs["env"]
+        self.assertNotIn("_PYI_APPLICATION_HOME_DIR", environment)
+        self.assertEqual(environment["NORMAL_VALUE"], "kept")
+        self.assertEqual(environment["PYINSTALLER_RESET_ENVIRONMENT"], "1")
 
 
 if __name__ == "__main__":

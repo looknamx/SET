@@ -126,7 +126,8 @@ def download_app_update(download_url, current_executable, expected_sha256=None):
         ":install_update\n"
         f'move /y "{temp_executable}" "{current_executable}" > NUL\n'
         f'if not exist "{current_executable}" goto update_failed\n'
-        "timeout /t 2 /nobreak > NUL\n"
+        "timeout /t 5 /nobreak > NUL\n"
+        'set "PYINSTALLER_RESET_ENVIRONMENT=1"\n'
         f'start "" "{current_executable}"\n'
         "timeout /t 3 /nobreak > NUL\n"
         f'del /f /q "{backup_executable}"\n'
@@ -143,8 +144,14 @@ def download_app_update(download_url, current_executable, expected_sha256=None):
 
 
 def launch_updater(batch_path):
+    environment = os.environ.copy()
+    for name in tuple(environment):
+        if name.startswith("_PYI_"):
+            environment.pop(name, None)
+    environment["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
     subprocess.Popen(
         ["cmd.exe", "/c", os.path.abspath(batch_path)],
         cwd=os.path.dirname(os.path.abspath(batch_path)),
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        env=environment,
     )
