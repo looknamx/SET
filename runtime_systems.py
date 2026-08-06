@@ -233,3 +233,22 @@ def select_due_skill(skills, sp_percent, combat_active, last_cast, now=None):
         if now - last_cast.get(tracker_key, 0.0) >= cooldown:
             return index, skill, tracker_key
     return None
+
+
+def select_due_buff(
+    buff_settings, last_cast, now=None, last_global_cast=None, global_interval=0.5
+):
+    now = time.monotonic() if now is None else now
+    if (
+        last_global_cast is not None
+        and now - last_global_cast < max(0.0, float(global_interval))
+    ):
+        return None
+    for raw_key, raw_cooldown in buff_settings.items():
+        key = str(raw_key).strip().lower()
+        if not key:
+            continue
+        cooldown = max(1.0, float(raw_cooldown))
+        if key not in last_cast or now - last_cast[key] >= cooldown:
+            return key, cooldown
+    return None

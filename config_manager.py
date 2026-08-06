@@ -60,12 +60,16 @@ PROFILE_DEFAULTS = {
 
 MASTER_DEFAULTS = {"GLOBAL": {"UIScale": "1.0", "ActiveProfile": "Profile 1"}}
 
+# These sections contain user-managed rows. Defaults seed a brand-new profile,
+# but missing rows in an existing section mean the user deliberately deleted them.
+USER_MANAGED_SECTIONS = {"POTIONS", "AUTO_BUFF_ITEM", "SKILL_ROTATION"}
+
 
 def get_config_dir(app_dir, frozen=False, local_app_data=None):
-    if not frozen:
-        return os.path.abspath(app_dir)
-    base_dir = local_app_data or os.environ.get("LOCALAPPDATA") or app_dir
-    return os.path.join(os.path.abspath(base_dir), "AI-looknam-Promax")
+    base_dir = local_app_data or os.environ.get("LOCALAPPDATA")
+    if base_dir:
+        return os.path.join(os.path.abspath(base_dir), "AI-looknam-Promax")
+    return os.path.abspath(app_dir)
 
 
 def migrate_legacy_config(legacy_path, destination_path):
@@ -95,9 +99,12 @@ def _load_with_defaults(path, defaults):
 
     changed = backup_path is not None or not os.path.exists(path)
     for section, options in defaults.items():
-        if not parser.has_section(section):
+        section_missing = not parser.has_section(section)
+        if section_missing:
             parser.add_section(section)
             changed = True
+        elif section in USER_MANAGED_SECTIONS:
+            continue
         for key, value in options.items():
             if not parser.has_option(section, key):
                 parser.set(section, key, value)
