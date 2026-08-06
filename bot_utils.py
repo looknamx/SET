@@ -281,6 +281,29 @@ def safe_click(title, x=None, y=None, button="left", input_lock=None):
     return True
 
 
+def _send_physical_alphanumeric(key, key_up=False):
+    if len(key) != 1 or not key.isascii() or not key.isalnum():
+        return False
+    virtual_key = ord(key.upper())
+    scan_code = win32api.MapVirtualKey(virtual_key, 0) & 0xFF
+    if not scan_code:
+        raise RuntimeError(f"No physical scan code for key: {key}")
+    context = interception.key_down.__globals__["_g_context"]
+    flags = interception.KeyFlag.KEY_UP if key_up else interception.KeyFlag.KEY_DOWN
+    context.send(context.keyboard, interception.KeyStroke(scan_code, flags))
+    return True
+
+
+def _key_down_layout_independent(key):
+    if not _send_physical_alphanumeric(key):
+        interception.key_down(key)
+
+
+def _key_up_layout_independent(key):
+    if not _send_physical_alphanumeric(key, key_up=True):
+        interception.key_up(key)
+
+
 class _NullLock:
     def __enter__(self):
         return self
@@ -301,7 +324,7 @@ def safe_press(title, key_str, key_lock):
     with key_lock:
         try:
             for key in keys:
-                interception.key_down(key)
+                _key_down_layout_independent(key)
                 pressed_keys.append(key)
             time.sleep(0.05)
         except Exception:
@@ -309,7 +332,7 @@ def safe_press(title, key_str, key_lock):
         finally:
             for key in reversed(pressed_keys):
                 try:
-                    interception.key_up(key)
+                    _key_up_layout_independent(key)
                 except Exception:
                     pass
     return True

@@ -13,6 +13,7 @@ from runtime_systems import (
     StuckRecoveryManager,
     evaluate_worker_health,
     load_with_single_recovery,
+    select_due_buff,
     select_due_skill,
     select_potion_action,
 )
@@ -27,6 +28,26 @@ from updater import (
 
 
 class BotCoreTests(unittest.TestCase):
+    def test_buff_is_due_immediately_then_respects_cooldown(self):
+        settings = {"i": 150.0, "o": 30.0}
+        self.assertEqual(select_due_buff(settings, {}, now=5.0), ("i", 150.0))
+        last_cast = {"i": 5.0}
+        self.assertEqual(select_due_buff(settings, last_cast, now=6.0), ("o", 30.0))
+        last_cast["o"] = 6.0
+        self.assertIsNone(select_due_buff(settings, last_cast, now=20.0))
+        self.assertEqual(select_due_buff(settings, last_cast, now=36.0), ("o", 30.0))
+
+    def test_buff_rotation_waits_half_second_between_keys(self):
+        settings = {"i": 150.0, "o": 30.0}
+        last_cast = {"i": 10.0}
+        self.assertIsNone(
+            select_due_buff(settings, last_cast, now=10.49, last_global_cast=10.0)
+        )
+        self.assertEqual(
+            select_due_buff(settings, last_cast, now=10.5, last_global_cast=10.0),
+            ("o", 30.0),
+        )
+
     def test_version_comparison_handles_different_lengths(self):
         self.assertTrue(is_newer_version("2.10", "2.9.9"))
         self.assertFalse(is_newer_version("2.4.0", "2.4"))
@@ -66,6 +87,16 @@ class BotCoreTests(unittest.TestCase):
             os.path.join("C:\\Users\\Test\\AppData\\Local", "AI-looknam-Promax"),
         )
 
+    def test_source_and_frozen_app_share_the_same_config_directory(self):
+        local_app_data = "C:\\Users\\Test\\AppData\\Local"
+        source_path = get_config_dir(
+            "C:\\Source", frozen=False, local_app_data=local_app_data
+        )
+        frozen_path = get_config_dir(
+            "C:\\PortableBot", frozen=True, local_app_data=local_app_data
+        )
+        self.assertEqual(source_path, frozen_path)
+
     def test_legacy_config_migrates_once_without_overwriting_saved_values(self):
         with tempfile.TemporaryDirectory() as directory:
             legacy = os.path.join(directory, "legacy", "config.ini")
@@ -90,6 +121,21 @@ class BotCoreTests(unittest.TestCase):
             self.assertTrue(reloaded.getboolean("GENERAL", "AttackClick"))
             self.assertFalse(os.path.exists(f"{path}.tmp"))
 
+    def test_deleted_user_managed_rows_are_not_restored_from_defaults(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "profile.ini")
+            profile, _ = load_profile(path)
+            profile.remove_section("AUTO_BUFF_ITEM")
+            profile.add_section("AUTO_BUFF_ITEM")
+            profile.remove_option("POTIONS", "1")
+            save_profile(profile, path)
+
+            reloaded, _ = load_profile(path)
+
+            self.assertEqual(dict(reloaded["AUTO_BUFF_ITEM"]), {})
+            self.assertNotIn("1", reloaded["POTIONS"])
+            self.assertIn("0", reloaded["POTIONS"])
+
     def test_safe_press_releases_keys_after_error(self):
         released = []
         with mock.patch.object(bot_utils, "game_is_active", return_value=True), \
@@ -98,6 +144,30 @@ class BotCoreTests(unittest.TestCase):
             success = bot_utils.safe_press("Ragnarok", "ctrl+f1", threading.Lock())
         self.assertFalse(success)
         self.assertEqual(released, ["ctrl"])
+
+    def test_safe_press_uses_physical_scan_code_for_letter_keys(self):
+        events = []
+        with mock.patch.object(bot_utils, "game_is_active", return_value=True), \
+                mock.patch.object(
+                    bot_utils,
+                    "_send_physical_alphanumeric",
+                    side_effect=lambda key, key_up=False: events.append((key, key_up)) or True,
+                ), \
+                mock.patch.object(bot_utils.interception, "key_down") as library_key_down:
+            success = bot_utils.safe_press("Ragnarok", "i", threading.Lock())
+        self.assertTrue(success)
+        self.assertEqual(events, [("i", False), ("i", True)])
+        library_key_down.assert_not_called()
+
+    def test_physical_letter_scan_codes_ignore_active_keyboard_layout(self):
+        context = mock.Mock()
+        with mock.patch.object(bot_utils.win32api, "MapVirtualKey", return_value=0x17), \
+                mock.patch.dict(
+                    bot_utils.interception.key_down.__globals__, {"_g_context": context}
+                ):
+            self.assertTrue(bot_utils._send_physical_alphanumeric("i"))
+        stroke = context.send.call_args.args[1]
+        self.assertEqual(stroke.code, 0x17)
 
     def test_target_lock_prefers_existing_target(self):
         monsters = [(110, 100, 0.5), (500, 500, 0.99)]

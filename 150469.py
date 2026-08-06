@@ -56,6 +56,7 @@ from runtime_systems import (
     StuckRecoveryManager,
     evaluate_worker_health,
     load_with_single_recovery,
+    select_due_buff,
     select_due_skill,
     select_potion_action,
 )
@@ -63,7 +64,7 @@ from runtime_systems import (
 # =========================================================
 # 🌟 ตั้งค่า Auto-Update 
 # =========================================================
-CURRENT_VERSION = "2.7.2"
+CURRENT_VERSION = "2.7.3"
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/looknamx/SET/main/version.txt"
 GITHUB_MANIFEST_URL = "https://raw.githubusercontent.com/looknamx/SET/main/release_manifest.json"
 GITHUB_MODEL_MANIFEST_URL = "https://raw.githubusercontent.com/looknamx/SET/main/model_manifest.json"
@@ -164,6 +165,8 @@ class BotApp(ctk.CTk):
         self.run_started_at = 0.0
         self._watchdog_alert_times = {}
         self._preflight_running = False
+        self._config_save_job = None
+        self._loading_ui = False
 
         self.load_master_config()
         
@@ -172,6 +175,7 @@ class BotApp(ctk.CTk):
         
         self.load_config_file()
         self.build_ui()
+        self.bind_config_autosave()
         
         sys.stdout = RedirectText(self.log_textbox, self)
         threading.Thread(target=self.hotkey_listener, daemon=True).start()
@@ -461,6 +465,7 @@ class BotApp(ctk.CTk):
         print(f">> 🔄 สลับและโหลดการตั้งค่าของ [{self.active_profile}] สำเร็จ!")
 
     def refresh_ui_vars(self):
+        self._loading_ui = True
         self.var_game_title.set(self.game_title)
         self.var_offset.set(str(self.offset_px))
         self.var_conf_monster.set(str(self.conf_monster))
@@ -502,20 +507,18 @@ class BotApp(ctk.CTk):
         self.var_watchdog_errors.set(str(self.watchdog_max_errors))
         self.var_webhook.set(self.discord_webhook_url)
         
-        for widget in self.buff_rows_container.winfo_children(): widget.destroy()
-        self.buff_ui_rows.clear()
-        for key, val in self.buff_settings.items(): self.add_buff_ui_row(key, str(val))
-        
+        self.render_buffs()
         self.render_potions()
         self.render_skills()
         self.update_hotkey_display()
+        self._loading_ui = False
 
     def set_ui_scale(self, scale_val):
         self.ui_scale = scale_val
         ctk.set_widget_scaling(scale_val)
         ctk.set_window_scaling(scale_val)
         self.master_cfg['GLOBAL']['UIScale'] = str(scale_val)
-        with open(self.master_file, 'w', encoding='utf-8') as f: self.master_cfg.write(f)
+        save_profile(self.master_cfg, self.master_file)
         print(f">> 📏 ปรับขนาดหน้าจอเป็น: {int(scale_val*100)}%")
 
     def build_ui(self):
@@ -685,8 +688,7 @@ class BotApp(ctk.CTk):
         self.buff_rows_container = ctk.CTkFrame(self.scroll_pot, fg_color="transparent")
         self.buff_rows_container.pack(fill="x", padx=5)
         self.buff_ui_rows = []
-        for key, val in self.buff_settings.items():
-            self.add_buff_ui_row(key, str(val))
+        self.render_buffs()
         ctk.CTkButton(
             self.scroll_pot,
             text="+ เพิ่มปุ่มบัพ",
@@ -696,6 +698,21 @@ class BotApp(ctk.CTk):
             hover_color="#3b3b3b",
             command=lambda: self.add_buff_ui_row("", ""),
         ).pack(pady=(5, 15))
+        ctk.CTkButton(
+            self.scroll_pot,
+            text="บันทึก Auto Buff",
+            height=32,
+            fg_color="#A65D1A",
+            hover_color="#CC7722",
+            command=self.save_config,
+        ).pack(pady=(0, 5))
+        self.lbl_potion_save_status = ctk.CTkLabel(
+            self.scroll_pot,
+            text="บันทึกอัตโนมัติเมื่อแก้ไข",
+            font=("Arial", 11),
+            text_color="#888888",
+        )
+        self.lbl_potion_save_status.pack(pady=(0, 8))
 
         ctk.CTkFrame(self.scroll_pot, height=1, fg_color="#444444").pack(fill="x", padx=15, pady=(0, 10))
         ctk.CTkLabel(self.scroll_pot, text="[ SKILL ROTATION ]", text_color="#66B2FF", font=("Arial", 14, "bold")).pack(pady=(10, 5))
@@ -752,6 +769,15 @@ class BotApp(ctk.CTk):
         for index, skill in enumerate(self.skills_list):
             self.create_skill_row(index, skill)
 
+    def render_buffs(self):
+        if not hasattr(self, "buff_rows_container"):
+            return
+        for widget in self.buff_rows_container.winfo_children():
+            widget.destroy()
+        self.buff_ui_rows.clear()
+        for key, value in self.buff_settings.items():
+            self.add_buff_ui_row(key, str(value))
+
     def create_skill_row(self, index, data):
         row = ctk.CTkFrame(self.skill_container, fg_color="transparent")
         row.pack(fill="x", pady=2)
@@ -761,6 +787,8 @@ class BotApp(ctk.CTk):
         cooldown = ctk.StringVar(value=str(data["cooldown"]))
         min_sp = ctk.StringVar(value=str(data["min_sp"]))
         target_only = ctk.BooleanVar(value=data["target_only"])
+        for variable in (enabled, key, cooldown, min_sp, target_only):
+            self.watch_config_var(variable)
         ctk.CTkSwitch(row, text="", variable=enabled, width=30, switch_width=28, switch_height=14).grid(row=0, column=0)
         ctk.CTkEntry(row, textvariable=key, width=45, justify="center", height=22).grid(row=0, column=1, padx=2)
         ctk.CTkEntry(row, textvariable=cooldown, width=52, justify="center", height=22).grid(row=0, column=2, padx=2)
@@ -794,6 +822,7 @@ class BotApp(ctk.CTk):
         if 0 <= index < len(self.skills_list):
             self.skills_list.pop(index)
         self.render_skills()
+        self.schedule_config_save()
 
     def render_potions(self):
         for widget in self.pot_container.winfo_children(): widget.destroy()
@@ -802,6 +831,7 @@ class BotApp(ctk.CTk):
     def create_potion_row(self, index, data):
         f = ctk.CTkFrame(self.pot_container, fg_color="transparent"); f.pack(fill="x", pady=2); f.grid_columnconfigure((0,1,2,3,4,5), weight=1)
         en_var = ctk.BooleanVar(value=data["en"]); type_var = ctk.StringVar(value=data["type"]); pct_var = ctk.StringVar(value=str(data["pct"])); key_var = ctk.StringVar(value=data["key"]); del_var = ctk.StringVar(value=str(data["dly"]))
+        for variable in (en_var, type_var, pct_var, key_var, del_var): self.watch_config_var(variable)
         ctk.CTkSwitch(f, text="", variable=en_var, width=30, switch_width=28, switch_height=14).grid(row=0, column=0)
         ctk.CTkComboBox(f, values=["HP", "SP"], variable=type_var, width=60, height=22).grid(row=0, column=1, padx=2)
         ctk.CTkEntry(f, textvariable=pct_var, width=45, justify="center", height=22).grid(row=0, column=2, padx=2)
@@ -810,7 +840,7 @@ class BotApp(ctk.CTk):
         ctk.CTkButton(f, text="X", width=22, height=22, fg_color="#ff4c4c", hover_color="#cc0000", command=lambda idx=index: self.delete_potion_row(idx)).grid(row=0, column=5)
         self.potion_widgets.append({"en": en_var, "type": type_var, "pct": pct_var, "key": key_var, "del": del_var})
     def add_new_potion_row(self): self.save_potions_to_list(); self.potions_list.append({"type": "HP", "pct": "50", "key": "", "dly": "50", "en": True}); self.render_potions()
-    def delete_potion_row(self, index): self.save_potions_to_list(); 0 <= index < len(self.potions_list) and self.potions_list.pop(index); self.render_potions()
+    def delete_potion_row(self, index): self.save_potions_to_list(); 0 <= index < len(self.potions_list) and self.potions_list.pop(index); self.render_potions(); self.schedule_config_save()
     def save_potions_to_list(self): self.potions_list = [{"en": w["en"].get(), "type": w["type"].get(), "pct": w["pct"].get(), "key": w["key"].get(), "dly": w["del"].get()} for w in self.potion_widgets]
 
     def check_for_updates(self, silent=False):
@@ -855,14 +885,54 @@ class BotApp(ctk.CTk):
     def add_buff_ui_row(self, k, v):
         r = ctk.CTkFrame(self.buff_rows_container, fg_color="transparent"); r.pack(fill="x", pady=2)
         kv, vv = ctk.StringVar(value=k), ctk.StringVar(value=v)
+        self.watch_config_var(kv); self.watch_config_var(vv)
         ctk.CTkLabel(r, text="ปุ่ม:").pack(side="left", padx=5); ctk.CTkEntry(r, textvariable=kv, width=50, justify="center").pack(side="left", padx=5)
         ctk.CTkLabel(r, text="วิ:").pack(side="left", padx=5); ctk.CTkEntry(r, textvariable=vv, width=60, justify="center").pack(side="left", padx=5)
         ctk.CTkButton(r, text="ลบ", width=40, fg_color="#CC0000", command=lambda f=r: self.remove_buff_ui_row(f)).pack(side="right", padx=5)
         self.buff_ui_rows.append({'frame': r, 'key_var': kv, 'val_var': vv})
-    def remove_buff_ui_row(self, f): f.destroy(); self.buff_ui_rows = [row for row in self.buff_ui_rows if row['frame'] != f]
+    def remove_buff_ui_row(self, f): f.destroy(); self.buff_ui_rows = [row for row in self.buff_ui_rows if row['frame'] != f]; self.schedule_config_save()
     def create_input_row(self, p, l, v, show_char=""): 
         f = ctk.CTkFrame(p, fg_color="transparent"); f.pack(fill="x", pady=2)
         ctk.CTkLabel(f, text=l, width=145, anchor="e").pack(side="left", padx=5); ctk.CTkEntry(f, textvariable=v, width=195, show=show_char).pack(side="left", padx=5)
+
+    def watch_config_var(self, variable):
+        variable.trace_add("write", self.schedule_config_save)
+
+    def bind_config_autosave(self):
+        variables = (
+            self.var_game_title, self.var_offset, self.var_stop_on_death,
+            self.var_yolo_en, self.var_buff_en, self.var_pot_en,
+            self.var_skill_rotation, self.var_attack_click,
+            self.var_attack_interval, self.var_rare_action, self.var_rare_key,
+            self.var_mouse_device, self.var_keyboard_device,
+            self.var_conf_monster, self.var_conf_rare, self.var_hk_master,
+            self.var_enable_teleport, self.var_teleport_mode,
+            self.var_teleport_key, self.var_teleport_wait,
+            self.var_auto_tp_stuck, self.var_auto_tp_stuck_sec,
+            self.var_smart_target, self.var_target_blacklist,
+            self.var_target_edge, self.var_stuck_move,
+            self.var_stuck_attempts, self.var_stuck_window,
+            self.var_target_progress, self.var_watchdog,
+            self.var_watchdog_worker_timeout, self.var_watchdog_game_timeout,
+            self.var_watchdog_errors, self.var_webhook,
+        )
+        for variable in variables:
+            self.watch_config_var(variable)
+
+    def schedule_config_save(self, *_):
+        if self._loading_ui:
+            return
+        if self._config_save_job is not None:
+            self.after_cancel(self._config_save_job)
+        if hasattr(self, "lbl_potion_save_status"):
+            self.lbl_potion_save_status.configure(
+                text="กำลังบันทึก...", text_color="#FFCC66"
+            )
+        self._config_save_job = self.after(700, self.autosave_config)
+
+    def autosave_config(self):
+        self._config_save_job = None
+        self.save_config(silent=True)
 
     def save_config(self, silent=False):
         global config, config_file
@@ -937,10 +1007,20 @@ class BotApp(ctk.CTk):
             save_profile(config, config_file)
         except OSError as error:
             print(f">> Config save failed ({config_file}): {error}")
+            if hasattr(self, "lbl_potion_save_status"):
+                self.lbl_potion_save_status.configure(
+                    text="บันทึกไม่สำเร็จ กรุณาดู System Log",
+                    text_color="#FF6666",
+                )
             if not silent:
                 self.btn_save.configure(text="Save failed", fg_color="#FF3333")
             return False
         self.update_runtime_vars(); self.update_hotkey_display() 
+        if hasattr(self, "lbl_potion_save_status"):
+            self.lbl_potion_save_status.configure(
+                text=f"บันทึก {self.active_profile} แล้ว",
+                text_color="#66CC88",
+            )
         
         if not silent:
             self.btn_save.configure(text="✅ บันทึกสำเร็จ!", fg_color="green")
@@ -964,6 +1044,9 @@ class BotApp(ctk.CTk):
             time.sleep(0.05)
 
     def on_close(self):
+        if self._config_save_job is not None:
+            self.after_cancel(self._config_save_job)
+            self._config_save_job = None
         try:
             self.save_config(silent=True)
         except Exception as error:
@@ -1105,12 +1188,14 @@ class BotApp(ctk.CTk):
         self.run_started_at = time.monotonic()
         self.worker_heartbeats = {
             "bot": self.run_started_at,
+            "buff": self.run_started_at,
             "potion": self.run_started_at,
             "skill": self.run_started_at,
         }
-        self.worker_errors = {"bot": 0, "potion": 0, "skill": 0}
+        self.worker_errors = {"bot": 0, "buff": 0, "potion": 0, "skill": 0}
         self.worker_error_times = {
             "bot": deque(),
+            "buff": deque(),
             "potion": deque(),
             "skill": deque(),
             "input": deque(),
@@ -1119,6 +1204,7 @@ class BotApp(ctk.CTk):
         print(">> Bot started")
         self.worker_threads = [
             threading.Thread(target=self.bot_main_loop, args=(self.run_event,), daemon=True),
+            threading.Thread(target=self.buff_loop, args=(self.run_event,), daemon=True),
             threading.Thread(target=self.potion_loop, args=(self.run_event,), daemon=True),
             threading.Thread(target=self.skill_rotation_loop, args=(self.run_event,), daemon=True),
         ]
@@ -1254,6 +1340,38 @@ class BotApp(ctk.CTk):
                     self.record_worker_error("potion", e)
                     time.sleep(0.2)
 
+    def buff_loop(self, run_event):
+        last_cast = {}
+        last_global_cast = None
+        configured_keys = None
+        while not run_event.wait(0.1):
+            try:
+                self.touch_worker("buff")
+                keys = tuple(self.buff_settings)
+                if keys != configured_keys:
+                    configured_keys = keys
+                    key_list = ", ".join(key.upper() for key in keys) or "none"
+                    print(f">> Buff worker: keys [{key_list}]")
+                if not self.buff_enabled or not game_is_active(self.game_title):
+                    continue
+                action = select_due_buff(
+                    dict(self.buff_settings),
+                    last_cast,
+                    time.monotonic(),
+                    last_global_cast=last_global_cast,
+                    global_interval=0.5,
+                )
+                if not action:
+                    continue
+                key, _ = action
+                if self.human_press(key):
+                    last_cast[key] = time.monotonic()
+                    last_global_cast = last_cast[key]
+                    print(f">> Buff: [{key.upper()}]")
+            except Exception as error:
+                self.record_worker_error("buff", error)
+                time.sleep(0.2)
+
     def skill_rotation_loop(self, run_event):
         last_cast = {}
         last_global_cast = 0.0
@@ -1349,7 +1467,7 @@ class BotApp(ctk.CTk):
                     now,
                     {
                         worker_name: self.worker_heartbeats.get(worker_name, self.run_started_at)
-                        for worker_name in ("bot", "potion", "skill")
+                        for worker_name in ("bot", "buff", "potion", "skill")
                     },
                     self.worker_errors,
                     self.watchdog_worker_timeout,
@@ -1413,7 +1531,6 @@ class BotApp(ctk.CTk):
             failure_window_seconds=self.stuck_failure_window,
         )
         engagement_timer = EngagementTimer(missing_reset_seconds=0.5)
-        last_buff_cast = {}
         last_death_check = last_move_log = last_rare_alert = last_preview = 0.0
         last_tp_check = target_started = last_attack = now
         target_progress_anchor = None
@@ -1443,7 +1560,6 @@ class BotApp(ctk.CTk):
                         last_attack += paused_for
                         last_death_check += paused_for
                         last_rare_alert += paused_for
-                        last_buff_cast = {key: value + paused_for for key, value in last_buff_cast.items()}
                         pause_started = None
                         self.after(0, lambda: self.lbl_status_main.configure(text="Status: running", text_color="#55FF55"))
 
@@ -1453,16 +1569,6 @@ class BotApp(ctk.CTk):
                         continue
                     center_x = monitor["left"] + monitor["width"] // 2
                     center_y = monitor["top"] + monitor["height"] // 2 - 1
-
-                    if self.buff_enabled:
-                        for key, cooldown in list(self.buff_settings.items()):
-                            if current_time - last_buff_cast.get(key, 0.0) >= cooldown:
-                                safe_move_to(self.game_title, center_x, center_y)
-                                time.sleep(0.2)
-                                if self.human_press(key):
-                                    print(f">> Buff: [{key.upper()}]")
-                                    last_buff_cast[key] = time.monotonic()
-                                    last_tp_check = time.monotonic()
 
                     img_bgr = cv2.cvtColor(np.array(sct.grab(monitor)), cv2.COLOR_BGRA2BGR)
 
