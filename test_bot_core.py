@@ -6,8 +6,9 @@ import unittest
 from unittest import mock
 
 import bot_utils
-from config_manager import load_profile
+from config_manager import get_config_dir, load_profile, migrate_legacy_config, save_profile
 from runtime_systems import (
+    EngagementTimer,
     SmartTargetManager,
     StuckRecoveryManager,
     evaluate_worker_health,
@@ -54,6 +55,41 @@ class BotCoreTests(unittest.TestCase):
             self.assertTrue(backup and os.path.exists(backup))
             self.assertTrue(profile.has_section("GENERAL"))
 
+    def test_frozen_config_uses_stable_local_app_data_directory(self):
+        path = get_config_dir(
+            "C:\\PortableBot",
+            frozen=True,
+            local_app_data="C:\\Users\\Test\\AppData\\Local",
+        )
+        self.assertEqual(
+            path,
+            os.path.join("C:\\Users\\Test\\AppData\\Local", "AI-looknam-Promax"),
+        )
+
+    def test_legacy_config_migrates_once_without_overwriting_saved_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            legacy = os.path.join(directory, "legacy", "config.ini")
+            destination = os.path.join(directory, "stable", "config.ini")
+            os.makedirs(os.path.dirname(legacy))
+            with open(legacy, "w", encoding="utf-8") as handle:
+                handle.write("old")
+            self.assertTrue(migrate_legacy_config(legacy, destination))
+            with open(destination, "w", encoding="utf-8") as handle:
+                handle.write("saved")
+            self.assertFalse(migrate_legacy_config(legacy, destination))
+            with open(destination, "r", encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "saved")
+
+    def test_profile_save_is_atomic_and_reloadable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "profile.ini")
+            profile, _ = load_profile(path)
+            profile["GENERAL"]["AttackClick"] = "True"
+            save_profile(profile, path)
+            reloaded, _ = load_profile(path)
+            self.assertTrue(reloaded.getboolean("GENERAL", "AttackClick"))
+            self.assertFalse(os.path.exists(f"{path}.tmp"))
+
     def test_safe_press_releases_keys_after_error(self):
         released = []
         with mock.patch.object(bot_utils, "game_is_active", return_value=True), \
@@ -93,6 +129,20 @@ class BotCoreTests(unittest.TestCase):
         self.assertEqual(first.action, "reposition")
         self.assertLess(first.escape_point[0], 500)
         self.assertEqual(second.action, "teleport")
+
+    def test_engagement_timeout_is_not_reset_by_continuous_target_movement(self):
+        timer = EngagementTimer(missing_reset_seconds=0.5)
+        self.assertEqual(timer.observe(True, now=1.0), 0.0)
+        self.assertEqual(timer.observe(True, now=5.0), 4.0)
+        self.assertEqual(timer.observe(True, now=11.0), 10.0)
+
+    def test_engagement_resets_only_after_target_is_missing_long_enough(self):
+        timer = EngagementTimer(missing_reset_seconds=0.5)
+        timer.observe(True, now=1.0)
+        timer.observe(False, now=2.0)
+        self.assertAlmostEqual(timer.observe(True, now=2.2), 1.2)
+        timer.observe(False, now=3.0)
+        self.assertEqual(timer.observe(True, now=3.6), 0.0)
 
     def test_potion_priority_uses_emergency_hp_item_only(self):
         potions = [

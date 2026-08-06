@@ -1,5 +1,6 @@
 import configparser
 import os
+import shutil
 import time
 
 
@@ -60,6 +61,25 @@ PROFILE_DEFAULTS = {
 MASTER_DEFAULTS = {"GLOBAL": {"UIScale": "1.0", "ActiveProfile": "Profile 1"}}
 
 
+def get_config_dir(app_dir, frozen=False, local_app_data=None):
+    if not frozen:
+        return os.path.abspath(app_dir)
+    base_dir = local_app_data or os.environ.get("LOCALAPPDATA") or app_dir
+    return os.path.join(os.path.abspath(base_dir), "AI-looknam-Promax")
+
+
+def migrate_legacy_config(legacy_path, destination_path):
+    legacy_path = os.path.abspath(legacy_path)
+    destination_path = os.path.abspath(destination_path)
+    if legacy_path == destination_path or os.path.exists(destination_path):
+        return False
+    if not os.path.isfile(legacy_path):
+        return False
+    os.makedirs(os.path.dirname(destination_path), exist_ok=True)
+    shutil.copy2(legacy_path, destination_path)
+    return True
+
+
 def _load_with_defaults(path, defaults):
     parser = configparser.ConfigParser()
     backup_path = None
@@ -97,5 +117,15 @@ def load_master(path):
 
 
 def save_profile(parser, path):
-    with open(path, "w", encoding="utf-8") as handle:
-        parser.write(handle)
+    path = os.path.abspath(path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temp_path = f"{path}.tmp"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            parser.write(handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)

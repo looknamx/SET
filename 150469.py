@@ -33,7 +33,13 @@ from bot_utils import (
     safe_move_to,
     safe_press,
 )
-from config_manager import load_master, load_profile, save_profile
+from config_manager import (
+    get_config_dir,
+    load_master,
+    load_profile,
+    migrate_legacy_config,
+    save_profile,
+)
 from updater import (
     download_app_update,
     download_validated_model,
@@ -44,6 +50,7 @@ from updater import (
     launch_updater,
 )
 from runtime_systems import (
+    EngagementTimer,
     PreflightResult,
     SmartTargetManager,
     StuckRecoveryManager,
@@ -56,7 +63,7 @@ from runtime_systems import (
 # =========================================================
 # 🌟 ตั้งค่า Auto-Update 
 # =========================================================
-CURRENT_VERSION = "2.7.1"
+CURRENT_VERSION = "2.7.2"
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/looknamx/SET/main/version.txt"
 GITHUB_MANIFEST_URL = "https://raw.githubusercontent.com/looknamx/SET/main/release_manifest.json"
 GITHUB_MODEL_MANIFEST_URL = "https://raw.githubusercontent.com/looknamx/SET/main/model_manifest.json"
@@ -68,10 +75,25 @@ GITHUB_MODEL_SHA256 = ""
 APP_DIR = os.path.dirname(
     os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__)
 )
+CONFIG_DIR = os.path.abspath(
+    os.environ.get("AI_LOOKNAM_CONFIG_DIR")
+    or get_config_dir(
+        APP_DIR,
+        frozen=getattr(sys, "frozen", False),
+        local_app_data=os.environ.get("LOCALAPPDATA"),
+    )
+)
 
 
 def app_path(filename):
     return os.path.join(APP_DIR, filename)
+
+
+def config_path(filename):
+    destination = os.path.join(CONFIG_DIR, filename)
+    if migrate_legacy_config(app_path(filename), destination):
+        print(f">> Migrated config to: {destination}")
+    return destination
 
 
 def bundled_path(filename):
@@ -110,7 +132,7 @@ ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
 config = configparser.ConfigParser()
-config_file = app_path('config_Profile_1.ini')
+config_file = config_path('config_Profile_1.ini')
 
 class BotApp(ctk.CTk):
     def __init__(self):
@@ -157,7 +179,7 @@ class BotApp(ctk.CTk):
         self.after(100, self.init_bot_systems)
 
     def load_master_config(self):
-        self.master_file = app_path('master.ini')
+        self.master_file = config_path('master.ini')
         self.master_cfg, backup_path = load_master(self.master_file)
         if backup_path:
             print(f">> Invalid master config was backed up to: {backup_path}")
@@ -170,7 +192,7 @@ class BotApp(ctk.CTk):
 
     def load_config_file(self):
         global config, config_file
-        config_file = app_path(f"config_{self.active_profile.replace(' ', '_')}.ini")
+        config_file = config_path(f"config_{self.active_profile.replace(' ', '_')}.ini")
         config, backup_path = load_profile(config_file)
         if backup_path:
             print(f">> Invalid config was backed up to: {backup_path}")
@@ -427,10 +449,12 @@ class BotApp(ctk.CTk):
             self.toggle_master()
             print(">> 🛑 หยุดการทำงานอัตโนมัติ เพื่อสลับโปรไฟล์")
             
-        self.save_config(silent=True) 
+        if not self.save_config(silent=True):
+            self.profile_var.set(self.active_profile)
+            return
         self.active_profile = choice
         self.master_cfg['GLOBAL']['ActiveProfile'] = self.active_profile
-        with open(self.master_file, 'w', encoding='utf-8') as f: self.master_cfg.write(f)
+        save_profile(self.master_cfg, self.master_file)
         
         self.load_config_file() 
         self.refresh_ui_vars()  
@@ -909,13 +933,22 @@ class BotApp(ctk.CTk):
                 f"{skill['target_only']},{skill['en']}"
             )
             
-        save_profile(config, config_file)
+        try:
+            save_profile(config, config_file)
+        except OSError as error:
+            print(f">> Config save failed ({config_file}): {error}")
+            if not silent:
+                self.btn_save.configure(text="Save failed", fg_color="#FF3333")
+            return False
         self.update_runtime_vars(); self.update_hotkey_display() 
         
         if not silent:
             self.btn_save.configure(text="✅ บันทึกสำเร็จ!", fg_color="green")
             self.after(2000, lambda: self.btn_save.configure(text="💾 บันทึกการตั้งค่า (Save)", fg_color=["#3B8ED0", "#1F6AA5"]))
             print(f">> 💾 บันทึกข้อมูลลง {self.active_profile} สำเร็จ!")
+
+        print(f">> Config file: {config_file}")
+        return True
 
     def check_key_pressed(self, k):
         try: return k and keyboard.is_pressed(k)
@@ -931,6 +964,10 @@ class BotApp(ctk.CTk):
             time.sleep(0.05)
 
     def on_close(self):
+        try:
+            self.save_config(silent=True)
+        except Exception as error:
+            print(f">> Config save on exit failed: {error}")
         self.shutdown_event.set()
         self.stop_bot("application closed", update_ui=False)
         self.destroy()
@@ -1375,6 +1412,7 @@ class BotApp(ctk.CTk):
             attempts_before_teleport=self.stuck_attempts_before_tp,
             failure_window_seconds=self.stuck_failure_window,
         )
+        engagement_timer = EngagementTimer(missing_reset_seconds=0.5)
         last_buff_cast = {}
         last_death_check = last_move_log = last_rare_alert = last_preview = 0.0
         last_tp_check = target_started = last_attack = now
@@ -1401,6 +1439,7 @@ class BotApp(ctk.CTk):
                         paused_for = current_time - pause_started
                         last_tp_check += paused_for
                         target_started += paused_for
+                        engagement_timer.shift(paused_for)
                         last_attack += paused_for
                         last_death_check += paused_for
                         last_rare_alert += paused_for
@@ -1496,7 +1535,6 @@ class BotApp(ctk.CTk):
                         )
                         target = decision.target
                         if target is not None and decision.is_new:
-                            target_started = current_time
                             target_hits = 1
                             target_progress_anchor = (target[0], target[1])
                         elif target is not None:
@@ -1507,19 +1545,16 @@ class BotApp(ctk.CTk):
                                 target[1] - target_progress_anchor[1]
                             ) ** 2
                             if progress_sq >= self.target_progress_px ** 2:
-                                target_started = current_time
                                 target_progress_anchor = (target[0], target[1])
                         if target is not None:
                             last_tp_check = current_time
                         else:
                             target_hits = 0
-                            target_started = current_time
                             target_progress_anchor = None
                     else:
                         target_manager.clear_lock()
                         target_hits = 0
-                        target_started = current_time
-                        target_progress_anchor = None
+                    engagement_seconds = engagement_timer.observe(target is not None, current_time)
 
                     self.combat_active = target is not None
 
@@ -1527,7 +1562,7 @@ class BotApp(ctk.CTk):
                         if target_hits < 2:
                             continue
                         target_x, target_y, _ = target
-                        if self.auto_tp_stuck and current_time - target_started >= self.auto_tp_stuck_sec:
+                        if self.auto_tp_stuck and engagement_seconds >= self.auto_tp_stuck_sec:
                             target_manager.mark_failed(target, current_time)
                             recovery = stuck_manager.register_failure(
                                 target, (center_x, center_y), monitor, current_time
@@ -1550,6 +1585,7 @@ class BotApp(ctk.CTk):
                                         self.human_press("enter")
                                     print(">> Stuck recovery: teleport")
                             last_tp_check = target_started = time.monotonic()
+                            engagement_timer.reset()
                             target_hits = 0
                             target_progress_anchor = None
                             self.combat_active = False

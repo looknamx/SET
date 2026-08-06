@@ -137,6 +137,40 @@ class StuckRecoveryManager:
         return RecoveryDecision("reposition", (x, y), recent)
 
 
+class EngagementTimer:
+    def __init__(self, missing_reset_seconds=0.5):
+        self.missing_reset_seconds = max(0.0, float(missing_reset_seconds))
+        self.started_at = None
+        self.missing_since = None
+
+    def observe(self, has_target, now=None):
+        now = time.monotonic() if now is None else now
+        if has_target:
+            if self.started_at is None:
+                self.started_at = now
+            elif (
+                self.missing_since is not None
+                and now - self.missing_since >= self.missing_reset_seconds
+            ):
+                self.started_at = now
+            self.missing_since = None
+            return max(0.0, now - self.started_at)
+
+        if self.missing_since is None:
+            self.missing_since = now
+        return 0.0
+
+    def reset(self):
+        self.started_at = None
+        self.missing_since = None
+
+    def shift(self, seconds):
+        if self.started_at is not None:
+            self.started_at += seconds
+        if self.missing_since is not None:
+            self.missing_since += seconds
+
+
 def load_with_single_recovery(loader, recovery):
     try:
         return loader(), False
