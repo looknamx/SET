@@ -55,6 +55,7 @@ from runtime_systems import (
     SmartTargetManager,
     StuckRecoveryManager,
     evaluate_worker_health,
+    get_due_buffs,
     load_with_single_recovery,
     select_due_buff,
     select_due_skill,
@@ -64,7 +65,7 @@ from runtime_systems import (
 # =========================================================
 # 🌟 ตั้งค่า Auto-Update 
 # =========================================================
-CURRENT_VERSION = "2.7.4"
+CURRENT_VERSION = "2.7.5"
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/looknamx/SET/main/version.txt"
 GITHUB_MANIFEST_URL = "https://raw.githubusercontent.com/looknamx/SET/main/release_manifest.json"
 GITHUB_MODEL_MANIFEST_URL = "https://raw.githubusercontent.com/looknamx/SET/main/model_manifest.json"
@@ -159,6 +160,7 @@ class BotApp(ctk.CTk):
         self.vitals_lock = threading.Lock()
         self.action_lock = threading.RLock()
         self.buff_cast_event = threading.Event()
+        self.last_teleport_at = 0.0
         self.latest_vitals = {"hp": None, "sp": None, "updated": 0.0}
         self.combat_active = False
         self.worker_heartbeats = {}
@@ -1308,6 +1310,22 @@ class BotApp(ctk.CTk):
             self.log_throttled("mouse_move_error", f">> Mouse move error: {error}")
             return False
 
+    def perform_teleport(self, run_event, allow_during_buff=False):
+        if self.buff_cast_event.is_set() and not allow_during_buff:
+            return False
+        with self.action_lock:
+            if self.buff_cast_event.is_set() and not allow_during_buff:
+                return False
+            if not self.human_press(self.teleport_key, allow_during_buff=True):
+                return False
+            if self.teleport_mode == "Skill":
+                if run_event.wait(0.2):
+                    return False
+                if not self.human_press("enter", allow_during_buff=True):
+                    return False
+            self.last_teleport_at = time.monotonic()
+            return True
+
     def log_throttled(self, key, message, interval=5.0):
         now = time.monotonic()
         if now - self._log_times.get(key, 0.0) >= interval:
@@ -1387,50 +1405,71 @@ class BotApp(ctk.CTk):
                     self.record_worker_error("potion", e)
                     time.sleep(0.2)
 
+    def wait_for_buff_phase(self, run_event, seconds):
+        deadline = time.monotonic() + max(0.0, seconds)
+        while not run_event.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return True
+            self.touch_worker("buff")
+            run_event.wait(min(0.25, remaining))
+        return False
+
+    def teleport_before_buff(self, run_event):
+        self.after(0, lambda: self.lbl_status_main.configure(
+            text="Status: teleporting before buff", text_color="#FFD700"
+        ))
+        now = time.monotonic()
+        if self.last_teleport_at and now - self.last_teleport_at <= 2.0:
+            remaining = max(0.0, self.last_teleport_at + 0.8 - now)
+            print(">> Buff cycle: using the recent teleport")
+            return self.wait_for_buff_phase(run_event, remaining)
+        print(">> Buff cycle: teleporting to create a safe cast window")
+        if not self.perform_teleport(run_event, allow_during_buff=True):
+            return False
+        print(">> Buff cycle: waiting 0.8s for teleport black screen")
+        return self.wait_for_buff_phase(run_event, 0.8)
+
     def buff_loop(self, run_event):
         last_cast = {}
-        last_global_cast = None
         configured_keys = None
         while not run_event.wait(0.1):
             try:
                 self.touch_worker("buff")
-                keys = tuple(self.buff_settings)
+                settings = dict(self.buff_settings)
+                keys = tuple(settings)
                 if keys != configured_keys:
                     configured_keys = keys
                     key_list = ", ".join(key.upper() for key in keys) or "none"
                     print(f">> Buff worker: keys [{key_list}]")
                 if not self.buff_enabled or not game_is_active(self.game_title):
                     continue
-                action = select_due_buff(
-                    dict(self.buff_settings),
-                    last_cast,
-                    time.monotonic(),
-                    last_global_cast=last_global_cast,
-                    global_interval=0.5,
-                )
-                if not action:
+                due_buffs = get_due_buffs(settings, last_cast, time.monotonic())
+                if not due_buffs:
                     continue
-                key, _, cast_delay = action
+
                 self.buff_cast_event.set()
                 try:
                     with self.action_lock:
                         if run_event.is_set() or not game_is_active(self.game_title):
                             continue
-                        self.after(0, lambda k=key: self.lbl_status_main.configure(
-                            text=f"Status: casting buff [{k.upper()}]",
-                            text_color="#FFD700",
-                        ))
-                        if self.human_press(key, allow_during_buff=True):
+                        if last_cast and self.enable_teleport:
+                            if not self.teleport_before_buff(run_event):
+                                continue
+                        for key, _, cast_delay in due_buffs:
+                            if run_event.is_set() or not game_is_active(self.game_title):
+                                break
+                            self.after(0, lambda k=key: self.lbl_status_main.configure(
+                                text=f"Status: casting buff [{k.upper()}]",
+                                text_color="#FFD700",
+                            ))
+                            if not self.human_press(key, allow_during_buff=True):
+                                break
                             last_cast[key] = time.monotonic()
-                            last_global_cast = last_cast[key]
-                            print(f">> Buff: [{key.upper()}], waiting {cast_delay:.1f}s")
-                            deadline = time.monotonic() + cast_delay
-                            while not run_event.is_set():
-                                remaining = deadline - time.monotonic()
-                                if remaining <= 0:
-                                    break
-                                self.touch_worker("buff")
-                                run_event.wait(min(0.25, remaining))
+                            wait_seconds = max(0.5, cast_delay)
+                            print(f">> Buff: [{key.upper()}], waiting {wait_seconds:.1f}s")
+                            if not self.wait_for_buff_phase(run_event, wait_seconds):
+                                break
                 finally:
                     self.buff_cast_event.clear()
                     if not run_event.is_set():
@@ -1612,6 +1651,7 @@ class BotApp(ctk.CTk):
         rare_hits = 0
         pause_started = None
         recovery_grace_until = 0.0
+        observed_teleport_at = self.last_teleport_at
 
         with mss.mss() as sct:
             while not run_event.is_set():
@@ -1634,6 +1674,13 @@ class BotApp(ctk.CTk):
                         last_attack += paused_for
                         last_death_check += paused_for
                         last_rare_alert += paused_for
+                        if self.last_teleport_at > observed_teleport_at:
+                            observed_teleport_at = self.last_teleport_at
+                            last_tp_check = target_started = current_time
+                            recovery_grace_until = max(
+                                recovery_grace_until,
+                                current_time + max(1.0, self.teleport_wait),
+                            )
                         pause_started = None
                         self.after(0, lambda: self.lbl_status_main.configure(text="Status: running", text_color="#55FF55"))
 
@@ -1759,10 +1806,8 @@ class BotApp(ctk.CTk):
                             elif recovery.action == "teleport" and self.auto_tp_stuck:
                                 self.human_move(center_x, center_y)
                                 time.sleep(0.1)
-                                if self.human_press(self.teleport_key):
-                                    if self.teleport_mode == "Skill":
-                                        time.sleep(0.2)
-                                        self.human_press("enter")
+                                if self.perform_teleport(run_event):
+                                    observed_teleport_at = self.last_teleport_at
                                     print(">> Stuck recovery: teleport")
                             last_tp_check = target_started = time.monotonic()
                             engagement_timer.reset()
@@ -1787,10 +1832,8 @@ class BotApp(ctk.CTk):
                             and current_time - last_tp_check >= self.teleport_wait
                         ):
                             print(f">> No monster for {self.teleport_wait:.1f}s; teleporting")
-                            if self.human_press(self.teleport_key):
-                                if self.teleport_mode == "Skill":
-                                    time.sleep(0.2)
-                                    self.human_press("enter")
+                            if self.perform_teleport(run_event):
+                                observed_teleport_at = self.last_teleport_at
                                 last_tp_check = target_started = time.monotonic()
                                 time.sleep(0.2)
                 except Exception as e:

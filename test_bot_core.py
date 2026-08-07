@@ -12,6 +12,7 @@ from runtime_systems import (
     SmartTargetManager,
     StuckRecoveryManager,
     evaluate_worker_health,
+    get_due_buffs,
     load_with_single_recovery,
     select_due_buff,
     select_due_skill,
@@ -57,6 +58,18 @@ class BotCoreTests(unittest.TestCase):
         self.assertEqual(
             select_due_buff(settings, {"i": 5.0}, now=6.0),
             ("o", 30.0, 1.0),
+        )
+
+    def test_buff_cycle_collects_all_due_buffs_for_one_teleport(self):
+        settings = {
+            "i": {"cooldown": 150.0, "cast_delay": 2.5},
+            "o": {"cooldown": 30.0, "cast_delay": 1.0},
+            "p": {"cooldown": 300.0, "cast_delay": 0.5},
+        }
+        last_cast = {"i": 10.0, "o": 100.0, "p": 200.0}
+        self.assertEqual(
+            get_due_buffs(settings, last_cast, now=160.0),
+            [("i", 150.0, 2.5), ("o", 30.0, 1.0)],
         )
 
     def test_version_comparison_handles_different_lengths(self):
