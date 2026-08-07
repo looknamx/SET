@@ -235,6 +235,29 @@ def select_due_skill(skills, sp_percent, combat_active, last_cast, now=None):
     return None
 
 
+def get_due_buffs(buff_settings, last_cast, now=None):
+    now = time.monotonic() if now is None else now
+    due = []
+    for raw_key, raw_setting in buff_settings.items():
+        key = str(raw_key).strip().lower()
+        if not key:
+            continue
+        if isinstance(raw_setting, dict):
+            cooldown = raw_setting.get("cooldown", 60.0)
+            cast_delay = raw_setting.get("cast_delay", 0.5)
+        elif isinstance(raw_setting, (tuple, list)):
+            cooldown = raw_setting[0]
+            cast_delay = raw_setting[1] if len(raw_setting) > 1 else 0.5
+        else:
+            cooldown = raw_setting
+            cast_delay = 0.5
+        cooldown = max(1.0, float(cooldown))
+        cast_delay = max(0.0, float(cast_delay))
+        if key not in last_cast or now - last_cast[key] >= cooldown:
+            due.append((key, cooldown, cast_delay))
+    return due
+
+
 def select_due_buff(
     buff_settings, last_cast, now=None, last_global_cast=None, global_interval=0.5
 ):
@@ -244,21 +267,5 @@ def select_due_buff(
         and now - last_global_cast < max(0.0, float(global_interval))
     ):
         return None
-    for raw_key, raw_cooldown in buff_settings.items():
-        key = str(raw_key).strip().lower()
-        if not key:
-            continue
-        if isinstance(raw_cooldown, dict):
-            cooldown = raw_cooldown.get("cooldown", 60.0)
-            cast_delay = raw_cooldown.get("cast_delay", 0.5)
-        elif isinstance(raw_cooldown, (tuple, list)):
-            cooldown = raw_cooldown[0]
-            cast_delay = raw_cooldown[1] if len(raw_cooldown) > 1 else 0.5
-        else:
-            cooldown = raw_cooldown
-            cast_delay = 0.5
-        cooldown = max(1.0, float(cooldown))
-        cast_delay = max(0.0, float(cast_delay))
-        if key not in last_cast or now - last_cast[key] >= cooldown:
-            return key, cooldown, cast_delay
-    return None
+    due = get_due_buffs(buff_settings, last_cast, now)
+    return due[0] if due else None
