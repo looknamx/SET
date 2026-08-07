@@ -1,6 +1,6 @@
 {
-    "model_version":  "2026.08.05.2",
-    "download_url":  "https://github.com/looknamx/SET/releases/download/model-2026.08.05.2/best.pt",
-    "sha256":  "fe2cfb41406dd9b12c563d31d8870ea9c9517f3bd9fd3bb26ec991c5d6c11518",
-    "min_app_version":  "2.7"
+    "model_version":  "2026.08.07.1",
+    "download_url":  "https://github.com/looknamx/SET/releases/download/model-2026.08.07.1/best.pt",
+    "sha256":  "64d2bce273bf7c32080a8835ce18478ae465c17d6986f17fa4c0e6e51b7dee66",
+    "min_app_version":  "2.7.4"
 }
