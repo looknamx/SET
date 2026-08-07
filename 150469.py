@@ -64,7 +64,7 @@ from runtime_systems import (
 # =========================================================
 # 🌟 ตั้งค่า Auto-Update 
 # =========================================================
-CURRENT_VERSION = "2.7.3"
+CURRENT_VERSION = "2.7.4"
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/looknamx/SET/main/version.txt"
 GITHUB_MANIFEST_URL = "https://raw.githubusercontent.com/looknamx/SET/main/release_manifest.json"
 GITHUB_MODEL_MANIFEST_URL = "https://raw.githubusercontent.com/looknamx/SET/main/model_manifest.json"
@@ -157,6 +157,8 @@ class BotApp(ctk.CTk):
         self.model_manifest = {}
         self.model_validated = False
         self.vitals_lock = threading.Lock()
+        self.action_lock = threading.RLock()
+        self.buff_cast_event = threading.Event()
         self.latest_vitals = {"hp": None, "sp": None, "updated": 0.0}
         self.combat_active = False
         self.worker_heartbeats = {}
@@ -264,7 +266,14 @@ class BotApp(ctk.CTk):
         self.buff_settings = {}
         if 'AUTO_BUFF_ITEM' in config:
             for key, value in config['AUTO_BUFF_ITEM'].items():
-                if value.strip(): self.buff_settings[key.strip().lower()] = clamp_float(value.strip(), 60.0, 1.0, 3600.0)
+                parts = [part.strip() for part in value.split(',', 1)]
+                if parts[0]:
+                    self.buff_settings[key.strip().lower()] = {
+                        "cooldown": clamp_float(parts[0], 60.0, 1.0, 3600.0),
+                        "cast_delay": clamp_float(
+                            parts[1] if len(parts) > 1 else '0.5', 0.5, 0.0, 30.0
+                        ),
+                    }
                 
         self.potions_list = []
         if 'POTIONS' in config:
@@ -696,7 +705,7 @@ class BotApp(ctk.CTk):
             height=28,
             fg_color="#4b4b4b",
             hover_color="#3b3b3b",
-            command=lambda: self.add_buff_ui_row("", ""),
+            command=lambda: self.add_buff_ui_row("", "", "0.5"),
         ).pack(pady=(5, 15))
         ctk.CTkButton(
             self.scroll_pot,
@@ -775,8 +784,10 @@ class BotApp(ctk.CTk):
         for widget in self.buff_rows_container.winfo_children():
             widget.destroy()
         self.buff_ui_rows.clear()
-        for key, value in self.buff_settings.items():
-            self.add_buff_ui_row(key, str(value))
+        for key, setting in self.buff_settings.items():
+            self.add_buff_ui_row(
+                key, str(setting["cooldown"]), str(setting["cast_delay"])
+            )
 
     def create_skill_row(self, index, data):
         row = ctk.CTkFrame(self.skill_container, fg_color="transparent")
@@ -882,14 +893,22 @@ class BotApp(ctk.CTk):
     def update_hotkey_display(self):
         self.lbl_hotkeys.configure(text=f"📌 Hotkey หลัก:\n• [{self.hk_master.upper()}] เริ่ม/หยุด ทำงานทั้งหมด (Master Toggle)")
         
-    def add_buff_ui_row(self, k, v):
+    def add_buff_ui_row(self, k, cooldown, cast_delay="0.5"):
         r = ctk.CTkFrame(self.buff_rows_container, fg_color="transparent"); r.pack(fill="x", pady=2)
-        kv, vv = ctk.StringVar(value=k), ctk.StringVar(value=v)
-        self.watch_config_var(kv); self.watch_config_var(vv)
+        kv = ctk.StringVar(value=k)
+        cooldown_var = ctk.StringVar(value=cooldown)
+        delay_var = ctk.StringVar(value=cast_delay)
+        self.watch_config_var(kv); self.watch_config_var(cooldown_var); self.watch_config_var(delay_var)
         ctk.CTkLabel(r, text="ปุ่ม:").pack(side="left", padx=5); ctk.CTkEntry(r, textvariable=kv, width=50, justify="center").pack(side="left", padx=5)
-        ctk.CTkLabel(r, text="วิ:").pack(side="left", padx=5); ctk.CTkEntry(r, textvariable=vv, width=60, justify="center").pack(side="left", padx=5)
+        ctk.CTkLabel(r, text="CD:").pack(side="left", padx=(3, 1)); ctk.CTkEntry(r, textvariable=cooldown_var, width=55, justify="center").pack(side="left", padx=2)
+        ctk.CTkLabel(r, text="รอ:").pack(side="left", padx=(3, 1)); ctk.CTkEntry(r, textvariable=delay_var, width=45, justify="center").pack(side="left", padx=2)
         ctk.CTkButton(r, text="ลบ", width=40, fg_color="#CC0000", command=lambda f=r: self.remove_buff_ui_row(f)).pack(side="right", padx=5)
-        self.buff_ui_rows.append({'frame': r, 'key_var': kv, 'val_var': vv})
+        self.buff_ui_rows.append({
+            'frame': r,
+            'key_var': kv,
+            'cooldown_var': cooldown_var,
+            'delay_var': delay_var,
+        })
     def remove_buff_ui_row(self, f): f.destroy(); self.buff_ui_rows = [row for row in self.buff_ui_rows if row['frame'] != f]; self.schedule_config_save()
     def create_input_row(self, p, l, v, show_char=""): 
         f = ctk.CTkFrame(p, fg_color="transparent"); f.pack(fill="x", pady=2)
@@ -988,8 +1007,11 @@ class BotApp(ctk.CTk):
         if 'AUTO_BUFF_ITEM' in config: config.remove_section('AUTO_BUFF_ITEM')
         config.add_section('AUTO_BUFF_ITEM')
         for row in self.buff_ui_rows:
-            k, v = row['key_var'].get().strip().lower(), row['val_var'].get().strip()
-            if k and v: config['AUTO_BUFF_ITEM'][k] = v
+            k = row['key_var'].get().strip().lower()
+            cooldown = row['cooldown_var'].get().strip()
+            cast_delay = row['delay_var'].get().strip()
+            if k and cooldown:
+                config['AUTO_BUFF_ITEM'][k] = f"{cooldown},{cast_delay or '0.5'}"
 
         self.save_skills_to_list()
         if 'SKILL_ROTATION' in config:
@@ -1058,6 +1080,7 @@ class BotApp(ctk.CTk):
     def stop_bot(self, reason="stopped", update_ui=True):
         if self.run_event is not None:
             self.run_event.set()
+        self.buff_cast_event.clear()
         self.running = False
         self.combat_active = False
         if update_ui:
@@ -1183,6 +1206,7 @@ class BotApp(ctk.CTk):
         print(f">> Input target: {window_info['game_title']!r} (HWND {window_info['game_hwnd']})")
 
         self.run_event = threading.Event()
+        self.buff_cast_event.clear()
         self.running = True
         self.combat_active = False
         self.run_started_at = time.monotonic()
@@ -1239,9 +1263,14 @@ class BotApp(ctk.CTk):
         self.lbl_pot_ind.configure(text="💊 เปิด" if self.potion_enabled else "💊 ปิด", text_color="#FF6666" if self.potion_enabled else "#7A7A7A")
         print(f">> 💊 ปั้มยา: {'ON' if self.potion_enabled else 'OFF'}")
 
-    def human_press(self, key_str):
+    def human_press(self, key_str, allow_during_buff=False):
         try:
-            success = safe_press(self.game_title, key_str, key_lock)
+            if self.buff_cast_event.is_set() and not allow_during_buff:
+                return False
+            with self.action_lock:
+                if self.buff_cast_event.is_set() and not allow_during_buff:
+                    return False
+                success = safe_press(self.game_title, key_str, key_lock)
             if not success:
                 self.log_throttled("inactive_game", ">> Skip key press: game window is not active")
             return success
@@ -1252,13 +1281,31 @@ class BotApp(ctk.CTk):
 
     def human_click(self, x, y):
         try:
-            success = safe_click(self.game_title, x, y, input_lock=key_lock)
+            if self.buff_cast_event.is_set():
+                return False
+            with self.action_lock:
+                if self.buff_cast_event.is_set():
+                    return False
+                success = safe_click(self.game_title, x, y, input_lock=key_lock)
             if not success:
                 self.log_throttled("inactive_game", ">> Skip click: game window is not active")
             return success
         except Exception as e:
             self.record_worker_error("input", e)
             self.log_throttled("mouse_click_error", f">> Mouse click error: {e}")
+            return False
+
+    def human_move(self, x, y):
+        try:
+            if self.buff_cast_event.is_set():
+                return False
+            with self.action_lock:
+                if self.buff_cast_event.is_set():
+                    return False
+                return safe_move_to(self.game_title, x, y)
+        except Exception as error:
+            self.record_worker_error("input", error)
+            self.log_throttled("mouse_move_error", f">> Mouse move error: {error}")
             return False
 
     def log_throttled(self, key, message, interval=5.0):
@@ -1325,7 +1372,7 @@ class BotApp(ctk.CTk):
                     with self.vitals_lock:
                         self.latest_vitals = {"hp": pct_hp, "sp": pct_sp, "updated": time.monotonic()}
                     
-                    if not self.potion_enabled: continue
+                    if not self.potion_enabled or self.buff_cast_event.is_set(): continue
 
                     action = select_potion_action(
                         list(self.potions_list), pct_hp, pct_sp, last_tracker, time.monotonic()
@@ -1363,11 +1410,33 @@ class BotApp(ctk.CTk):
                 )
                 if not action:
                     continue
-                key, _ = action
-                if self.human_press(key):
-                    last_cast[key] = time.monotonic()
-                    last_global_cast = last_cast[key]
-                    print(f">> Buff: [{key.upper()}]")
+                key, _, cast_delay = action
+                self.buff_cast_event.set()
+                try:
+                    with self.action_lock:
+                        if run_event.is_set() or not game_is_active(self.game_title):
+                            continue
+                        self.after(0, lambda k=key: self.lbl_status_main.configure(
+                            text=f"Status: casting buff [{k.upper()}]",
+                            text_color="#FFD700",
+                        ))
+                        if self.human_press(key, allow_during_buff=True):
+                            last_cast[key] = time.monotonic()
+                            last_global_cast = last_cast[key]
+                            print(f">> Buff: [{key.upper()}], waiting {cast_delay:.1f}s")
+                            deadline = time.monotonic() + cast_delay
+                            while not run_event.is_set():
+                                remaining = deadline - time.monotonic()
+                                if remaining <= 0:
+                                    break
+                                self.touch_worker("buff")
+                                run_event.wait(min(0.25, remaining))
+                finally:
+                    self.buff_cast_event.clear()
+                    if not run_event.is_set():
+                        self.after(0, lambda: self.lbl_status_main.configure(
+                            text="Status: running", text_color="#55FF55"
+                        ))
             except Exception as error:
                 self.record_worker_error("buff", error)
                 time.sleep(0.2)
@@ -1379,7 +1448,11 @@ class BotApp(ctk.CTk):
             try:
                 time.sleep(0.05)
                 self.touch_worker("skill")
-                if not self.skill_rotation_enabled or not game_is_active(self.game_title):
+                if (
+                    not self.skill_rotation_enabled
+                    or self.buff_cast_event.is_set()
+                    or not game_is_active(self.game_title)
+                ):
                     continue
                 with self.vitals_lock:
                     sp_percent = self.latest_vitals["sp"]
@@ -1544,11 +1617,12 @@ class BotApp(ctk.CTk):
             while not run_event.is_set():
                 try:
                     self.touch_worker("bot")
-                    if not game_is_active(self.game_title):
+                    if not game_is_active(self.game_title) or self.buff_cast_event.is_set():
                         if pause_started is None:
                             pause_started = time.monotonic()
-                            self.after(0, lambda: self.lbl_status_main.configure(text="Status: paused (game inactive)", text_color="orange"))
-                        time.sleep(0.2)
+                            if not self.buff_cast_event.is_set():
+                                self.after(0, lambda: self.lbl_status_main.configure(text="Status: paused (game inactive)", text_color="orange"))
+                        time.sleep(0.05 if self.buff_cast_event.is_set() else 0.2)
                         continue
 
                     current_time = time.monotonic()
@@ -1683,7 +1757,7 @@ class BotApp(ctk.CTk):
                                     time.sleep(0.5)
                                     recovery_grace_until = current_time + max(2.0, self.teleport_wait)
                             elif recovery.action == "teleport" and self.auto_tp_stuck:
-                                safe_move_to(self.game_title, center_x, center_y)
+                                self.human_move(center_x, center_y)
                                 time.sleep(0.1)
                                 if self.human_press(self.teleport_key):
                                     if self.teleport_mode == "Skill":
@@ -1700,13 +1774,13 @@ class BotApp(ctk.CTk):
                         if current_time - last_move_log >= 1.5:
                             print(f">> Target locked at X:{target_x}, Y:{target_y}")
                             last_move_log = current_time
-                        safe_move_to(self.game_title, target_x, target_y)
+                        self.human_move(target_x, target_y)
                         if self.attack_click and current_time - last_attack >= self.attack_interval:
                             if self.human_click(target_x, target_y):
                                 last_attack = time.monotonic()
                         time.sleep(0.05)
                     else:
-                        safe_move_to(self.game_title, center_x, center_y)
+                        self.human_move(center_x, center_y)
                         if (
                             self.enable_teleport
                             and current_time >= recovery_grace_until
