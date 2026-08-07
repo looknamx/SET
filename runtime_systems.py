@@ -248,7 +248,17 @@ def select_due_buff(
         key = str(raw_key).strip().lower()
         if not key:
             continue
-        cooldown = max(1.0, float(raw_cooldown))
+        if isinstance(raw_cooldown, dict):
+            cooldown = raw_cooldown.get("cooldown", 60.0)
+            cast_delay = raw_cooldown.get("cast_delay", 0.5)
+        elif isinstance(raw_cooldown, (tuple, list)):
+            cooldown = raw_cooldown[0]
+            cast_delay = raw_cooldown[1] if len(raw_cooldown) > 1 else 0.5
+        else:
+            cooldown = raw_cooldown
+            cast_delay = 0.5
+        cooldown = max(1.0, float(cooldown))
+        cast_delay = max(0.0, float(cast_delay))
         if key not in last_cast or now - last_cast[key] >= cooldown:
-            return key, cooldown
+            return key, cooldown, cast_delay
     return None

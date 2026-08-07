@@ -30,12 +30,12 @@ from updater import (
 class BotCoreTests(unittest.TestCase):
     def test_buff_is_due_immediately_then_respects_cooldown(self):
         settings = {"i": 150.0, "o": 30.0}
-        self.assertEqual(select_due_buff(settings, {}, now=5.0), ("i", 150.0))
+        self.assertEqual(select_due_buff(settings, {}, now=5.0), ("i", 150.0, 0.5))
         last_cast = {"i": 5.0}
-        self.assertEqual(select_due_buff(settings, last_cast, now=6.0), ("o", 30.0))
+        self.assertEqual(select_due_buff(settings, last_cast, now=6.0), ("o", 30.0, 0.5))
         last_cast["o"] = 6.0
         self.assertIsNone(select_due_buff(settings, last_cast, now=20.0))
-        self.assertEqual(select_due_buff(settings, last_cast, now=36.0), ("o", 30.0))
+        self.assertEqual(select_due_buff(settings, last_cast, now=36.0), ("o", 30.0, 0.5))
 
     def test_buff_rotation_waits_half_second_between_keys(self):
         settings = {"i": 150.0, "o": 30.0}
@@ -45,7 +45,18 @@ class BotCoreTests(unittest.TestCase):
         )
         self.assertEqual(
             select_due_buff(settings, last_cast, now=10.5, last_global_cast=10.0),
-            ("o", 30.0),
+            ("o", 30.0, 0.5),
+        )
+
+    def test_buff_rotation_returns_each_buffs_own_cast_delay(self):
+        settings = {
+            "i": {"cooldown": 150.0, "cast_delay": 2.5},
+            "o": {"cooldown": 30.0, "cast_delay": 1.0},
+        }
+        self.assertEqual(select_due_buff(settings, {}, now=5.0), ("i", 150.0, 2.5))
+        self.assertEqual(
+            select_due_buff(settings, {"i": 5.0}, now=6.0),
+            ("o", 30.0, 1.0),
         )
 
     def test_version_comparison_handles_different_lengths(self):
