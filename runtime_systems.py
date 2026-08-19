@@ -1,6 +1,9 @@
+import heapq
 import math
+import threading
 import time
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 
@@ -10,6 +13,99 @@ class PreflightResult:
     passed: bool
     detail: str
     required: bool = True
+
+
+ACTION_PRIORITIES = {
+    "emergency_hp": 0,
+    "system": 5,
+    "buff": 10,
+    "teleport": 20,
+    "potion": 25,
+    "skill": 30,
+    "attack": 40,
+    "move": 50,
+}
+
+
+@dataclass
+class _ActionRequest:
+    kind: str
+    priority: int
+    sequence: int
+    cancelled: bool = False
+
+
+class ActionScheduler:
+    """Serializes input actions and lets higher-priority waiters run first."""
+
+    def __init__(self, priorities=None):
+        self.priorities = dict(ACTION_PRIORITIES)
+        if priorities:
+            self.priorities.update(priorities)
+        self._condition = threading.Condition()
+        self._waiting = []
+        self._active = None
+        self._sequence = 0
+        self.last_action = None
+
+    def _remove(self, request):
+        request.cancelled = True
+        self._waiting = [item for item in self._waiting if item[2] is not request]
+        heapq.heapify(self._waiting)
+
+    @contextmanager
+    def claim(self, kind, timeout=1.0, cancel_event=None):
+        priority = self.priorities.get(kind, self.priorities["attack"])
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        with self._condition:
+            self._sequence += 1
+            request = _ActionRequest(kind, priority, self._sequence)
+            heapq.heappush(self._waiting, (priority, request.sequence, request))
+            acquired = False
+            while not acquired:
+                cancelled = request.cancelled or (
+                    cancel_event is not None and cancel_event.is_set()
+                )
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if cancelled or (remaining is not None and remaining <= 0):
+                    self._remove(request)
+                    self._condition.notify_all()
+                    break
+                if self._active is None and self._waiting[0][2] is request:
+                    heapq.heappop(self._waiting)
+                    self._active = request
+                    self.last_action = kind
+                    acquired = True
+                    break
+                self._condition.wait(
+                    0.05 if remaining is None else min(0.05, max(0.0, remaining))
+                )
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                with self._condition:
+                    if self._active is request:
+                        self._active = None
+                    self._condition.notify_all()
+
+    def run(self, kind, callback, timeout=1.0, cancel_event=None):
+        with self.claim(kind, timeout=timeout, cancel_event=cancel_event) as acquired:
+            return callback() if acquired else False
+
+    def reset(self):
+        with self._condition:
+            for _, _, request in self._waiting:
+                request.cancelled = True
+            self._waiting.clear()
+            self._condition.notify_all()
+
+    def snapshot(self):
+        with self._condition:
+            return {
+                "active": self._active.kind if self._active else None,
+                "waiting": [item[2].kind for item in sorted(self._waiting)],
+            }
 
 
 @dataclass(frozen=True)
@@ -25,11 +121,14 @@ class SmartTargetManager:
         blacklist_seconds=15.0,
         edge_margin_ratio=0.08,
         lock_radius_ratio=0.15,
+        lock_grace_seconds=0.4,
     ):
         self.blacklist_seconds = max(1.0, float(blacklist_seconds))
         self.edge_margin_ratio = max(0.0, min(float(edge_margin_ratio), 0.4))
         self.lock_radius_ratio = max(0.05, min(float(lock_radius_ratio), 0.5))
+        self.lock_grace_seconds = max(0.0, float(lock_grace_seconds))
         self.locked_target = None
+        self.lock_missing_since = None
         self.blacklist = []
         self._blacklist_radius = 100
 
@@ -44,6 +143,7 @@ class SmartTargetManager:
 
     def clear_lock(self):
         self.locked_target = None
+        self.lock_missing_since = None
 
     def mark_failed(self, target, now=None):
         if target is None:
@@ -57,23 +157,29 @@ class SmartTargetManager:
         self._prune_blacklist(now)
         self._blacklist_radius = max(80, int(width * 0.08))
         candidates = [target for target in monsters if not self._is_blacklisted(target)]
-        if not candidates:
-            self.clear_lock()
-            return TargetDecision(None, False)
-
         lock_radius = max(100, int(width * self.lock_radius_ratio))
         if self.locked_target is not None:
-            nearest = min(
-                candidates,
-                key=lambda item: (item[0] - self.locked_target[0]) ** 2
-                + (item[1] - self.locked_target[1]) ** 2,
-            )
-            distance_sq = (nearest[0] - self.locked_target[0]) ** 2 + (
-                nearest[1] - self.locked_target[1]
-            ) ** 2
-            if distance_sq <= lock_radius ** 2:
-                self.locked_target = (nearest[0], nearest[1])
-                return TargetDecision(nearest, False, 0.0)
+            if candidates:
+                nearest = min(
+                    candidates,
+                    key=lambda item: (item[0] - self.locked_target[0]) ** 2
+                    + (item[1] - self.locked_target[1]) ** 2,
+                )
+                distance_sq = (nearest[0] - self.locked_target[0]) ** 2 + (
+                    nearest[1] - self.locked_target[1]
+                ) ** 2
+                if distance_sq <= lock_radius ** 2:
+                    self.locked_target = (nearest[0], nearest[1])
+                    self.lock_missing_since = None
+                    return TargetDecision(nearest, False, 0.0)
+            if self.lock_missing_since is None:
+                self.lock_missing_since = now
+            if now - self.lock_missing_since < self.lock_grace_seconds:
+                return TargetDecision(None, False)
+            self.clear_lock()
+
+        if not candidates:
+            return TargetDecision(None, False)
 
         center_x, center_y = center
         left = center_x - width / 2
@@ -96,7 +202,67 @@ class SmartTargetManager:
         target = min(candidates, key=target_score)
         score = target_score(target)
         self.locked_target = (target[0], target[1])
+        self.lock_missing_since = None
         return TargetDecision(target, True, score)
+
+
+class KillConfirmationTracker:
+    def __init__(self, missing_frames=3, missing_seconds=0.3, min_engagement_seconds=0.1):
+        self.missing_frames_required = max(1, int(missing_frames))
+        self.missing_seconds_required = max(0.0, float(missing_seconds))
+        self.min_engagement_seconds = max(0.0, float(min_engagement_seconds))
+        self.confirmed_count = 0
+        self.reset()
+
+    def reset(self):
+        self.target = None
+        self.started_at = None
+        self.last_seen_at = None
+        self.missing_since = None
+        self.missing_frames = 0
+        self.engaged = False
+
+    def mark_engaged(self):
+        if self.target is not None:
+            self.engaged = True
+
+    def observe(self, target, now=None, interrupted=False):
+        now = time.monotonic() if now is None else now
+        if interrupted:
+            self.reset()
+            return False
+
+        if target is not None:
+            if self.target is None:
+                self.target = (target[0], target[1])
+                self.started_at = now
+                self.engaged = False
+            else:
+                self.target = (target[0], target[1])
+            self.last_seen_at = now
+            self.missing_since = None
+            self.missing_frames = 0
+            return False
+
+        if self.target is None:
+            return False
+        if self.missing_since is None:
+            self.missing_since = now
+        self.missing_frames += 1
+        last_seen = now if self.last_seen_at is None else self.last_seen_at
+        started = now if self.started_at is None else self.started_at
+        engagement_seconds = max(0.0, last_seen - started)
+        confirmed = (
+            self.engaged
+            and engagement_seconds >= self.min_engagement_seconds
+            and self.missing_frames >= self.missing_frames_required
+            and now - self.missing_since >= self.missing_seconds_required
+        )
+        if confirmed:
+            self.confirmed_count += 1
+            self.reset()
+            return True
+        return False
 
 
 @dataclass(frozen=True)

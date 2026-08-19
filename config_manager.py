@@ -34,6 +34,12 @@ PROFILE_DEFAULTS = {
         "BlacklistSec": "15.0",
         "EdgeMarginPct": "8",
     },
+    "KILL_CONFIRMATION": {
+        "Enabled": "True",
+        "MissingFrames": "3",
+        "MissingSeconds": "0.3",
+        "MinEngagementSeconds": "0.0",
+    },
     "STUCK_RECOVERY": {
         "MoveBeforeTeleport": "True",
         "AttemptsBeforeTeleport": "2",
