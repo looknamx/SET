@@ -32,6 +32,7 @@ from bot_utils import (
     safe_click,
     safe_move_to,
     safe_press,
+    safe_teleport_sequence,
 )
 from config_manager import (
     get_config_dir,
@@ -50,7 +51,9 @@ from updater import (
     launch_updater,
 )
 from runtime_systems import (
+    ActionScheduler,
     EngagementTimer,
+    KillConfirmationTracker,
     PreflightResult,
     SmartTargetManager,
     StuckRecoveryManager,
@@ -65,7 +68,7 @@ from runtime_systems import (
 # =========================================================
 # 🌟 ตั้งค่า Auto-Update 
 # =========================================================
-CURRENT_VERSION = "2.7.5"
+CURRENT_VERSION = "2.7.6"
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/looknamx/SET/main/version.txt"
 GITHUB_MANIFEST_URL = "https://raw.githubusercontent.com/looknamx/SET/main/release_manifest.json"
 GITHUB_MODEL_MANIFEST_URL = "https://raw.githubusercontent.com/looknamx/SET/main/model_manifest.json"
@@ -110,7 +113,7 @@ SP_START_X, SP_END_X, SP_Y = 48, 173, 103
 HP_COLOR, HP_COLOR_RED = (156, 173, 222), (222, 148, 173)
 SP_COLOR, SP_COLOR_RED = (156, 181, 238), (222, 148, 173)
 TOLERANCE = 40
-key_lock = threading.Lock()
+key_lock = threading.RLock()
 
 def is_color_match(r, g, b, target_color, tol):
     tr, tg, tb = target_color
@@ -159,10 +162,12 @@ class BotApp(ctk.CTk):
         self.model_validated = False
         self.vitals_lock = threading.Lock()
         self.action_lock = threading.RLock()
+        self.action_scheduler = ActionScheduler()
         self.buff_cast_event = threading.Event()
         self.last_teleport_at = 0.0
         self.latest_vitals = {"hp": None, "sp": None, "updated": 0.0}
         self.combat_active = False
+        self.confirmed_kills = 0
         self.worker_heartbeats = {}
         self.worker_errors = {}
         self.worker_error_times = {}
@@ -252,6 +257,11 @@ class BotApp(ctk.CTk):
         self.smart_target_enabled = parse_bool(config['SMART_TARGET'].get('Enabled'), True)
         self.target_blacklist_sec = clamp_float(config['SMART_TARGET'].get('BlacklistSec'), 15.0, 1.0, 300.0)
         self.target_edge_margin = clamp_float(config['SMART_TARGET'].get('EdgeMarginPct'), 8.0, 0.0, 40.0) / 100.0
+
+        self.kill_confirmation_enabled = parse_bool(config['KILL_CONFIRMATION'].get('Enabled'), True)
+        self.kill_missing_frames = clamp_int(config['KILL_CONFIRMATION'].get('MissingFrames'), 3, 2, 20)
+        self.kill_missing_seconds = clamp_float(config['KILL_CONFIRMATION'].get('MissingSeconds'), 0.3, 0.1, 3.0)
+        self.kill_min_engagement = clamp_float(config['KILL_CONFIRMATION'].get('MinEngagementSeconds'), 0.0, 0.0, 10.0)
 
         self.stuck_move_enabled = parse_bool(config['STUCK_RECOVERY'].get('MoveBeforeTeleport'), True)
         self.stuck_attempts_before_tp = clamp_int(config['STUCK_RECOVERY'].get('AttemptsBeforeTeleport'), 2, 1, 10)
@@ -508,6 +518,10 @@ class BotApp(ctk.CTk):
         self.var_smart_target.set(self.smart_target_enabled)
         self.var_target_blacklist.set(str(self.target_blacklist_sec))
         self.var_target_edge.set(str(int(self.target_edge_margin * 100)))
+        self.var_kill_confirmation.set(self.kill_confirmation_enabled)
+        self.var_kill_missing_frames.set(str(self.kill_missing_frames))
+        self.var_kill_missing_seconds.set(str(self.kill_missing_seconds))
+        self.var_kill_min_engagement.set(str(self.kill_min_engagement))
         self.var_stuck_move.set(self.stuck_move_enabled)
         self.var_stuck_attempts.set(str(self.stuck_attempts_before_tp))
         self.var_stuck_window.set(str(self.stuck_failure_window))
@@ -611,6 +625,10 @@ class BotApp(ctk.CTk):
         self.var_smart_target = ctk.BooleanVar(value=self.smart_target_enabled)
         self.var_target_blacklist = ctk.StringVar(value=str(self.target_blacklist_sec))
         self.var_target_edge = ctk.StringVar(value=str(int(self.target_edge_margin * 100)))
+        self.var_kill_confirmation = ctk.BooleanVar(value=self.kill_confirmation_enabled)
+        self.var_kill_missing_frames = ctk.StringVar(value=str(self.kill_missing_frames))
+        self.var_kill_missing_seconds = ctk.StringVar(value=str(self.kill_missing_seconds))
+        self.var_kill_min_engagement = ctk.StringVar(value=str(self.kill_min_engagement))
         self.var_stuck_move = ctk.BooleanVar(value=self.stuck_move_enabled)
         self.var_stuck_attempts = ctk.StringVar(value=str(self.stuck_attempts_before_tp))
         self.var_stuck_window = ctk.StringVar(value=str(self.stuck_failure_window))
@@ -674,6 +692,10 @@ class BotApp(ctk.CTk):
         ctk.CTkSwitch(self.scroll_cfg, text="เปิด Smart Target และ blacklist", variable=self.var_smart_target).pack(anchor="w", padx=20, pady=4)
         self.create_input_row(self.scroll_cfg, "Blacklist (sec):", self.var_target_blacklist)
         self.create_input_row(self.scroll_cfg, "Edge margin (%):", self.var_target_edge)
+        ctk.CTkSwitch(self.scroll_cfg, text="Enable Kill Confirmation", variable=self.var_kill_confirmation).pack(anchor="w", padx=20, pady=4)
+        self.create_input_row(self.scroll_cfg, "Missing frames:", self.var_kill_missing_frames)
+        self.create_input_row(self.scroll_cfg, "Missing time (sec):", self.var_kill_missing_seconds)
+        self.create_input_row(self.scroll_cfg, "Min engagement (sec):", self.var_kill_min_engagement)
         ctk.CTkSwitch(self.scroll_cfg, text="ขยับหนีก่อน teleport", variable=self.var_stuck_move).pack(anchor="w", padx=20, pady=4)
         self.create_input_row(self.scroll_cfg, "Failures before TP:", self.var_stuck_attempts)
         self.create_input_row(self.scroll_cfg, "Failure window (sec):", self.var_stuck_window)
@@ -932,6 +954,8 @@ class BotApp(ctk.CTk):
             self.var_auto_tp_stuck, self.var_auto_tp_stuck_sec,
             self.var_smart_target, self.var_target_blacklist,
             self.var_target_edge, self.var_stuck_move,
+            self.var_kill_confirmation, self.var_kill_missing_frames,
+            self.var_kill_missing_seconds, self.var_kill_min_engagement,
             self.var_stuck_attempts, self.var_stuck_window,
             self.var_target_progress, self.var_watchdog,
             self.var_watchdog_worker_timeout, self.var_watchdog_game_timeout,
@@ -988,6 +1012,12 @@ class BotApp(ctk.CTk):
             'Enabled': str(self.var_smart_target.get()),
             'BlacklistSec': self.var_target_blacklist.get().strip(),
             'EdgeMarginPct': self.var_target_edge.get().strip(),
+        }
+        config['KILL_CONFIRMATION'] = {
+            'Enabled': str(self.var_kill_confirmation.get()),
+            'MissingFrames': self.var_kill_missing_frames.get().strip(),
+            'MissingSeconds': self.var_kill_missing_seconds.get().strip(),
+            'MinEngagementSeconds': self.var_kill_min_engagement.get().strip(),
         }
         config['STUCK_RECOVERY'] = {
             'MoveBeforeTeleport': str(self.var_stuck_move.get()),
@@ -1082,6 +1112,7 @@ class BotApp(ctk.CTk):
     def stop_bot(self, reason="stopped", update_ui=True):
         if self.run_event is not None:
             self.run_event.set()
+        self.action_scheduler.reset()
         self.buff_cast_event.clear()
         self.running = False
         self.combat_active = False
@@ -1107,6 +1138,7 @@ class BotApp(ctk.CTk):
             "AI_CONFIDENCE",
             "TELEPORT",
             "SMART_TARGET",
+            "KILL_CONFIRMATION",
             "STUCK_RECOVERY",
             "WATCHDOG",
         )
@@ -1208,10 +1240,12 @@ class BotApp(ctk.CTk):
         print(f">> Input target: {window_info['game_title']!r} (HWND {window_info['game_hwnd']})")
 
         self.run_event = threading.Event()
+        self.action_scheduler.reset()
         self.buff_cast_event.clear()
         self.running = True
         self.combat_active = False
         self.run_started_at = time.monotonic()
+        self.confirmed_kills = 0
         self.worker_heartbeats = {
             "bot": self.run_started_at,
             "buff": self.run_started_at,
@@ -1265,14 +1299,50 @@ class BotApp(ctk.CTk):
         self.lbl_pot_ind.configure(text="💊 เปิด" if self.potion_enabled else "💊 ปิด", text_color="#FF6666" if self.potion_enabled else "#7A7A7A")
         print(f">> 💊 ปั้มยา: {'ON' if self.potion_enabled else 'OFF'}")
 
-    def human_press(self, key_str, allow_during_buff=False):
+    def _action_cancel_event(self):
+        return self.run_event if self.running else None
+
+    def _raw_press(self, key_str):
+        with self.action_lock:
+            return safe_press(self.game_title, key_str, key_lock)
+
+    def _raw_click(self, x, y):
+        with self.action_lock:
+            return safe_click(self.game_title, x, y, input_lock=key_lock)
+
+    def _raw_move(self, x, y):
+        with self.action_lock:
+            return safe_move_to(self.game_title, x, y)
+
+    def _raw_teleport(self, run_event):
+        with self.action_lock:
+            success = safe_teleport_sequence(
+                self.game_title,
+                self.teleport_key,
+                self.teleport_mode,
+                key_lock,
+                cancel_event=run_event,
+            )
+        if success:
+            self.last_teleport_at = time.monotonic()
+        return success
+
+    def human_press(self, key_str, action_kind="skill", allow_during_buff=False):
         try:
             if self.buff_cast_event.is_set() and not allow_during_buff:
                 return False
-            with self.action_lock:
+
+            def press():
                 if self.buff_cast_event.is_set() and not allow_during_buff:
                     return False
-                success = safe_press(self.game_title, key_str, key_lock)
+                return self._raw_press(key_str)
+
+            success = self.action_scheduler.run(
+                action_kind,
+                press,
+                timeout=1.0,
+                cancel_event=self._action_cancel_event(),
+            )
             if not success:
                 self.log_throttled("inactive_game", ">> Skip key press: game window is not active")
             return success
@@ -1281,14 +1351,22 @@ class BotApp(ctk.CTk):
             self.log_throttled("key_press_error", f">> Key press error: {e}")
             return False
 
-    def human_click(self, x, y):
+    def human_click(self, x, y, action_kind="attack"):
         try:
             if self.buff_cast_event.is_set():
                 return False
-            with self.action_lock:
+
+            def click():
                 if self.buff_cast_event.is_set():
                     return False
-                success = safe_click(self.game_title, x, y, input_lock=key_lock)
+                return self._raw_click(x, y)
+
+            success = self.action_scheduler.run(
+                action_kind,
+                click,
+                timeout=0.75,
+                cancel_event=self._action_cancel_event(),
+            )
             if not success:
                 self.log_throttled("inactive_game", ">> Skip click: game window is not active")
             return success
@@ -1297,14 +1375,22 @@ class BotApp(ctk.CTk):
             self.log_throttled("mouse_click_error", f">> Mouse click error: {e}")
             return False
 
-    def human_move(self, x, y):
+    def human_move(self, x, y, action_kind="move"):
         try:
             if self.buff_cast_event.is_set():
                 return False
-            with self.action_lock:
+
+            def move():
                 if self.buff_cast_event.is_set():
                     return False
-                return safe_move_to(self.game_title, x, y)
+                return self._raw_move(x, y)
+
+            return self.action_scheduler.run(
+                action_kind,
+                move,
+                timeout=0.15,
+                cancel_event=self._action_cancel_event(),
+            )
         except Exception as error:
             self.record_worker_error("input", error)
             self.log_throttled("mouse_move_error", f">> Mouse move error: {error}")
@@ -1313,18 +1399,18 @@ class BotApp(ctk.CTk):
     def perform_teleport(self, run_event, allow_during_buff=False):
         if self.buff_cast_event.is_set() and not allow_during_buff:
             return False
-        with self.action_lock:
+
+        def teleport():
             if self.buff_cast_event.is_set() and not allow_during_buff:
                 return False
-            if not self.human_press(self.teleport_key, allow_during_buff=True):
-                return False
-            if self.teleport_mode == "Skill":
-                if run_event.wait(0.2):
-                    return False
-                if not self.human_press("enter", allow_during_buff=True):
-                    return False
-            self.last_teleport_at = time.monotonic()
-            return True
+            return self._raw_teleport(run_event)
+
+        return self.action_scheduler.run(
+            "teleport",
+            teleport,
+            timeout=2.0,
+            cancel_event=run_event,
+        )
 
     def log_throttled(self, key, message, interval=5.0):
         now = time.monotonic()
@@ -1398,7 +1484,10 @@ class BotApp(ctk.CTk):
                     if action:
                         _, potion, tracker_key = action
                         low_counts[tracker_key] = low_counts.get(tracker_key, 0) + 1
-                        if low_counts[tracker_key] >= 2 and self.human_press(potion["key"]):
+                        action_kind = "emergency_hp" if potion["type"] == "HP" else "potion"
+                        if low_counts[tracker_key] >= 2 and self.human_press(
+                            potion["key"], action_kind=action_kind
+                        ):
                             last_tracker[tracker_key] = time.monotonic()
                             low_counts[tracker_key] = 0
                 except Exception as e:
@@ -1425,7 +1514,7 @@ class BotApp(ctk.CTk):
             print(">> Buff cycle: using the recent teleport")
             return self.wait_for_buff_phase(run_event, remaining)
         print(">> Buff cycle: teleporting to create a safe cast window")
-        if not self.perform_teleport(run_event, allow_during_buff=True):
+        if not self._raw_teleport(run_event):
             return False
         print(">> Buff cycle: waiting 0.8s for teleport black screen")
         return self.wait_for_buff_phase(run_event, 0.8)
@@ -1448,34 +1537,39 @@ class BotApp(ctk.CTk):
                 if not due_buffs:
                     continue
 
-                self.buff_cast_event.set()
-                try:
-                    with self.action_lock:
-                        if run_event.is_set() or not game_is_active(self.game_title):
-                            continue
-                        if last_cast and self.enable_teleport:
-                            if not self.teleport_before_buff(run_event):
-                                continue
-                        for key, _, cast_delay in due_buffs:
+                with self.action_scheduler.claim(
+                    "buff", timeout=3.0, cancel_event=run_event
+                ) as acquired:
+                    if not acquired:
+                        continue
+                    self.buff_cast_event.set()
+                    try:
+                        with self.action_lock:
                             if run_event.is_set() or not game_is_active(self.game_title):
-                                break
-                            self.after(0, lambda k=key: self.lbl_status_main.configure(
-                                text=f"Status: casting buff [{k.upper()}]",
-                                text_color="#FFD700",
+                                continue
+                            if last_cast and self.enable_teleport:
+                                if not self.teleport_before_buff(run_event):
+                                    continue
+                            for key, _, cast_delay in due_buffs:
+                                if run_event.is_set() or not game_is_active(self.game_title):
+                                    break
+                                self.after(0, lambda k=key: self.lbl_status_main.configure(
+                                    text=f"Status: casting buff [{k.upper()}]",
+                                    text_color="#FFD700",
+                                ))
+                                if not self._raw_press(key):
+                                    break
+                                last_cast[key] = time.monotonic()
+                                wait_seconds = max(0.5, cast_delay)
+                                print(f">> Buff: [{key.upper()}], waiting {wait_seconds:.1f}s")
+                                if not self.wait_for_buff_phase(run_event, wait_seconds):
+                                    break
+                    finally:
+                        self.buff_cast_event.clear()
+                        if not run_event.is_set():
+                            self.after(0, lambda: self.lbl_status_main.configure(
+                                text="Status: running", text_color="#55FF55"
                             ))
-                            if not self.human_press(key, allow_during_buff=True):
-                                break
-                            last_cast[key] = time.monotonic()
-                            wait_seconds = max(0.5, cast_delay)
-                            print(f">> Buff: [{key.upper()}], waiting {wait_seconds:.1f}s")
-                            if not self.wait_for_buff_phase(run_event, wait_seconds):
-                                break
-                finally:
-                    self.buff_cast_event.clear()
-                    if not run_event.is_set():
-                        self.after(0, lambda: self.lbl_status_main.configure(
-                            text="Status: running", text_color="#55FF55"
-                        ))
             except Exception as error:
                 self.record_worker_error("buff", error)
                 time.sleep(0.2)
@@ -1504,7 +1598,7 @@ class BotApp(ctk.CTk):
                 if not action:
                     continue
                 _, skill, tracker_key = action
-                if self.human_press(skill["key"]):
+                if self.human_press(skill["key"], action_kind="skill"):
                     last_cast[tracker_key] = time.monotonic()
                     last_global_cast = last_cast[tracker_key]
                     print(f">> Skill rotation: [{skill['key'].upper()}]")
@@ -1637,6 +1731,15 @@ class BotApp(ctk.CTk):
         target_manager = SmartTargetManager(
             blacklist_seconds=self.target_blacklist_sec if self.smart_target_enabled else 1.0,
             edge_margin_ratio=self.target_edge_margin if self.smart_target_enabled else 0.0,
+            lock_grace_seconds=(
+                max(0.5, self.kill_missing_seconds + 0.2)
+                if self.kill_confirmation_enabled else 0.0
+            ),
+        )
+        kill_tracker = KillConfirmationTracker(
+            missing_frames=self.kill_missing_frames,
+            missing_seconds=self.kill_missing_seconds,
+            min_engagement_seconds=self.kill_min_engagement,
         )
         stuck_manager = StuckRecoveryManager(
             attempts_before_teleport=self.stuck_attempts_before_tp,
@@ -1674,6 +1777,7 @@ class BotApp(ctk.CTk):
                         last_attack += paused_for
                         last_death_check += paused_for
                         last_rare_alert += paused_for
+                        kill_tracker.observe(None, current_time, interrupted=True)
                         if self.last_teleport_at > observed_teleport_at:
                             observed_teleport_at = self.last_teleport_at
                             last_tp_check = target_started = current_time
@@ -1753,34 +1857,40 @@ class BotApp(ctk.CTk):
                             self.after(0, self.stop_run_if_current, run_event, "rare item detected")
                             break
                         if self.rare_item_action == "Key" and self.rare_item_key:
-                            self.human_press(self.rare_item_key)
+                            self.human_press(self.rare_item_key, action_kind="system")
 
-                    target = None
-                    if monsters:
-                        decision = target_manager.select(
-                            monsters, (center_x, center_y), monitor["width"], monitor["height"], current_time
-                        )
-                        target = decision.target
-                        if target is not None and decision.is_new:
-                            target_hits = 1
+                    decision = target_manager.select(
+                        monsters,
+                        (center_x, center_y),
+                        monitor["width"],
+                        monitor["height"],
+                        current_time,
+                    )
+                    target = decision.target
+                    if target is not None and decision.is_new:
+                        target_hits = 1
+                        target_progress_anchor = (target[0], target[1])
+                    elif target is not None:
+                        target_hits += 1
+                        if target_progress_anchor is None:
                             target_progress_anchor = (target[0], target[1])
-                        elif target is not None:
-                            target_hits += 1
-                            if target_progress_anchor is None:
-                                target_progress_anchor = (target[0], target[1])
-                            progress_sq = (target[0] - target_progress_anchor[0]) ** 2 + (
-                                target[1] - target_progress_anchor[1]
-                            ) ** 2
-                            if progress_sq >= self.target_progress_px ** 2:
-                                target_progress_anchor = (target[0], target[1])
-                        if target is not None:
-                            last_tp_check = current_time
-                        else:
-                            target_hits = 0
-                            target_progress_anchor = None
+                        progress_sq = (target[0] - target_progress_anchor[0]) ** 2 + (
+                            target[1] - target_progress_anchor[1]
+                        ) ** 2
+                        if progress_sq >= self.target_progress_px ** 2:
+                            target_progress_anchor = (target[0], target[1])
                     else:
-                        target_manager.clear_lock()
                         target_hits = 0
+                        target_progress_anchor = None
+                    if target is not None:
+                        last_tp_check = current_time
+
+                    if decision.is_new and kill_tracker.target is not None:
+                        kill_tracker.observe(None, current_time, interrupted=True)
+                    kill_confirmed = kill_tracker.observe(target, current_time)
+                    if self.kill_confirmation_enabled and kill_confirmed:
+                        self.confirmed_kills = kill_tracker.confirmed_count
+                        print(f">> Kill confirmed #{self.confirmed_kills}")
                     engagement_seconds = engagement_timer.observe(target is not None, current_time)
 
                     self.combat_active = target is not None
@@ -1788,8 +1898,10 @@ class BotApp(ctk.CTk):
                     if target is not None:
                         if target_hits < 2:
                             continue
+                        kill_tracker.mark_engaged()
                         target_x, target_y, _ = target
                         if self.auto_tp_stuck and engagement_seconds >= self.auto_tp_stuck_sec:
+                            kill_tracker.observe(None, current_time, interrupted=True)
                             target_manager.mark_failed(target, current_time)
                             recovery = stuck_manager.register_failure(
                                 target, (center_x, center_y), monitor, current_time
@@ -1799,12 +1911,12 @@ class BotApp(ctk.CTk):
                                 f"(recovery {recovery.recent_failures}/{self.stuck_attempts_before_tp})"
                             )
                             if recovery.action == "reposition" and self.stuck_move_enabled and recovery.escape_point:
-                                if self.human_click(*recovery.escape_point):
+                                if self.human_click(*recovery.escape_point, action_kind="teleport"):
                                     print(f">> Stuck recovery: reposition to {recovery.escape_point}")
                                     time.sleep(0.5)
                                     recovery_grace_until = current_time + max(2.0, self.teleport_wait)
                             elif recovery.action == "teleport" and self.auto_tp_stuck:
-                                self.human_move(center_x, center_y)
+                                self.human_move(center_x, center_y, action_kind="teleport")
                                 time.sleep(0.1)
                                 if self.perform_teleport(run_event):
                                     observed_teleport_at = self.last_teleport_at
@@ -1831,6 +1943,7 @@ class BotApp(ctk.CTk):
                             and current_time >= recovery_grace_until
                             and current_time - last_tp_check >= self.teleport_wait
                         ):
+                            kill_tracker.observe(None, current_time, interrupted=True)
                             print(f">> No monster for {self.teleport_wait:.1f}s; teleporting")
                             if self.perform_teleport(run_event):
                                 observed_teleport_at = self.last_teleport_at

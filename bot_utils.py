@@ -338,6 +338,28 @@ def safe_press(title, key_str, key_lock):
     return True
 
 
+def safe_teleport_sequence(
+    title,
+    key_str,
+    mode,
+    key_lock,
+    cancel_event=None,
+    confirm_delay=0.2,
+):
+    """Send a teleport key and optional Enter as one input transaction."""
+    with key_lock:
+        if not safe_press(title, key_str, key_lock):
+            return False
+        if str(mode).strip().casefold() != "skill":
+            return True
+        if cancel_event is not None:
+            if cancel_event.wait(max(0.0, confirm_delay)):
+                return False
+        else:
+            time.sleep(max(0.0, confirm_delay))
+        return safe_press(title, "enter", key_lock)
+
+
 def download_file(url, destination, expected_sha256=None):
     headers = {"User-Agent": USER_AGENT, "Accept": "application/octet-stream"}
     dest_dir = os.path.dirname(os.path.abspath(destination)) or "."

@@ -2,13 +2,16 @@ import configparser
 import os
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
 import bot_utils
 from config_manager import get_config_dir, load_profile, migrate_legacy_config, save_profile
 from runtime_systems import (
+    ActionScheduler,
     EngagementTimer,
+    KillConfirmationTracker,
     SmartTargetManager,
     StuckRecoveryManager,
     evaluate_worker_health,
@@ -29,6 +32,45 @@ from updater import (
 
 
 class BotCoreTests(unittest.TestCase):
+    def test_action_scheduler_runs_waiters_in_priority_order(self):
+        scheduler = ActionScheduler()
+        completed = []
+
+        def request(kind):
+            scheduler.run(kind, lambda: completed.append(kind), timeout=2.0)
+
+        with scheduler.claim("system", timeout=1.0) as acquired:
+            self.assertTrue(acquired)
+            threads = [
+                threading.Thread(target=request, args=(kind,))
+                for kind in ("attack", "skill", "emergency_hp")
+            ]
+            for thread in threads:
+                thread.start()
+            deadline = time.monotonic() + 1.0
+            while len(scheduler.snapshot()["waiting"]) < 3 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(len(scheduler.snapshot()["waiting"]), 3)
+
+        for thread in threads:
+            thread.join(2.0)
+        self.assertEqual(completed, ["emergency_hp", "skill", "attack"])
+
+    def test_action_scheduler_cancel_event_drops_waiting_action(self):
+        scheduler = ActionScheduler()
+        cancel = threading.Event()
+        result = []
+        with scheduler.claim("system"):
+            thread = threading.Thread(
+                target=lambda: result.append(
+                    scheduler.run("attack", lambda: True, timeout=2.0, cancel_event=cancel)
+                )
+            )
+            thread.start()
+            cancel.set()
+        thread.join(2.0)
+        self.assertEqual(result, [False])
+
     def test_buff_is_due_immediately_then_respects_cooldown(self):
         settings = {"i": 150.0, "o": 30.0}
         self.assertEqual(select_due_buff(settings, {}, now=5.0), ("i", 150.0, 0.5))
@@ -87,6 +129,7 @@ class BotCoreTests(unittest.TestCase):
             self.assertTrue(profile.has_section("TELEPORT"))
             self.assertTrue(profile.has_option("GENERAL", "AttackClick"))
             self.assertTrue(profile.has_section("SMART_TARGET"))
+            self.assertTrue(profile.has_section("KILL_CONFIRMATION"))
             self.assertTrue(profile.has_section("STUCK_RECOVERY"))
             self.assertTrue(profile.has_section("WATCHDOG"))
             self.assertTrue(profile.has_section("SKILL_ROTATION"))
@@ -214,6 +257,36 @@ class BotCoreTests(unittest.TestCase):
         manager.mark_failed(target, now=1)
         self.assertIsNone(manager.select([target], (500, 500), 1000, 800, now=2).target)
         self.assertEqual(manager.select([target], (500, 500), 1000, 800, now=7).target, target)
+
+    def test_smart_target_holds_missing_lock_during_kill_confirmation_grace(self):
+        manager = SmartTargetManager(lock_grace_seconds=0.5)
+        target = (500, 500, 0.9)
+        manager.select([target], (500, 500), 1000, 800, now=1.0)
+        self.assertIsNone(manager.select([], (500, 500), 1000, 800, now=1.2).target)
+        self.assertIsNotNone(manager.locked_target)
+        manager.select([], (500, 500), 1000, 800, now=1.8)
+        self.assertIsNone(manager.locked_target)
+
+    def test_kill_confirmation_requires_engagement_and_sustained_disappearance(self):
+        tracker = KillConfirmationTracker(
+            missing_frames=3, missing_seconds=0.3, min_engagement_seconds=0.1
+        )
+        tracker.observe((500, 500, 0.9), now=1.0)
+        tracker.observe((502, 500, 0.9), now=1.2)
+        tracker.mark_engaged()
+        self.assertFalse(tracker.observe(None, now=1.3))
+        self.assertFalse(tracker.observe(None, now=1.45))
+        self.assertTrue(tracker.observe(None, now=1.65))
+        self.assertEqual(tracker.confirmed_count, 1)
+
+    def test_kill_confirmation_ignores_detector_flicker_and_interruptions(self):
+        tracker = KillConfirmationTracker(missing_frames=2, missing_seconds=0.1)
+        tracker.observe((500, 500, 0.9), now=1.0)
+        tracker.mark_engaged()
+        self.assertFalse(tracker.observe(None, now=1.1))
+        self.assertFalse(tracker.observe((501, 500, 0.9), now=1.2))
+        self.assertFalse(tracker.observe(None, now=1.3, interrupted=True))
+        self.assertEqual(tracker.confirmed_count, 0)
 
     def test_stuck_recovery_repositions_before_teleport(self):
         manager = StuckRecoveryManager(attempts_before_teleport=2)
